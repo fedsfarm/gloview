@@ -107,7 +107,8 @@ bool roughly(double a, double b, double tol = 3.0) {
 // Render a window's LIVE surface tree scaled into `destPx`, clipped to `clipPx`
 // (both monitor PIXEL coords) via real CSurfacePassElements. No crop rect to drift,
 // so immune to snapshots' stale/mis-cropped tiles; works on hidden workspaces.
-void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& destPx, const CBox& clipPx, float alpha, const Time::steady_tp& when) {
+void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& destPx, const CBox& clipPx, float alpha, const Time::steady_tp& when,
+                      double roundSlotPx = 0.0) {
     if (!w || !mon || !w->m_isMapped || !w->wlSurface() || !w->wlSurface()->resource())
         return;
     if (!(destPx.w > 0 && destPx.h > 0))
@@ -129,7 +130,10 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     // fit-exact scale rounds the surface edge 1-3px inside the box and the opaque backing
     // peeks through as thin dark seams (worst mid open-glide, destPx fractional every frame).
     // TL stays anchored (translate cancels scaleMod); clipPx trims the overflow.
-    const float pad      = 1.5F;
+    // When we round the surface (roundSlotPx > 0) the over-cover would push the rounded
+    // right/bottom corners past the slot so only the TL corner clips cleanly; drop the pad so
+    // the surface fills the slot exactly and all four rounded corners land on the slot edges.
+    const float pad      = roundSlotPx > 0.0 ? 0.F : 1.5F;
     const float sW       = (static_cast<float>(destPx.w) + pad) / std::max(logicalW * mon->m_scale, 5.F);
     const float sH       = (static_cast<float>(destPx.h) + pad) / std::max(logicalH * mon->m_scale, 5.F);
     const float scaleMod = std::max(sW, sH);
@@ -163,7 +167,7 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     data.fadeAlpha      = 1.F;
     data.alpha          = std::clamp(alpha, 0.F, 1.F);
     data.decorate       = false;
-    data.rounding       = 0;
+    data.rounding       = roundSlotPx > 0.0 ? roundSlotPx * mon->m_scale : 0.0;
     data.roundingPower  = w->roundingPower();
     data.blur           = false;
     data.pWindow        = w;
@@ -1371,7 +1375,10 @@ void Overview::renderStripWindows() const {
             // pre-scaled to pixels too (pxb), so surface and backing coincide at any monitor scale.
             const CBox slotPx(slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale);
             const CBox cardPx(card.x * scale, card.y * scale, card.w * scale, card.h * scale);
-            renderWindowLive(w, m, slotPx, cardPx, static_cast<float>(e), when);
+            // Add clipping to the previews in the strip
+            const double stripRound = std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
+                                               std::min(slot.w, slot.h) * 0.35);
+            renderWindowLive(w, m, slotPx, slotPx, static_cast<float>(e), when, stripRound);
         }
     }
 }
@@ -1521,7 +1528,7 @@ void Overview::renderMainWindows() const {
             continue;
         const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
         const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-        renderWindowLive(w, m, px, px, 1.0F, when);
+        renderWindowLive(w, m, px, px, 1.0F, when, static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
     }
 }
 
@@ -1546,7 +1553,7 @@ void Overview::renderDragWindow() const {
     const double scale = m->m_scale;
     const LRect  lb    = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
     const CBox   px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-    renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow());
+    renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow(), static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
 }
 
 bool Overview::isAboveLayer(const std::string& ns) const {
