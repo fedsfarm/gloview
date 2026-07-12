@@ -94,13 +94,16 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `strip_band_color` | color | `0x24ffffff` | Band behind the cards |
 | `strip_card_color` | color | `0x3a0e131c` | Inactive workspace card fill |
 | `strip_active_color` | color | `0x4d1c2c44` | Active workspace card fill |
-| `strip_active_border` | color | `0xf0ffffff` | Active card outline |
-| `strip_hover_border` | color | `0x80ffffff` | Hovered card outline |
+| `strip_active_border` | color | `0xf0ffffff` | Active card border |
+| `strip_active_border_size` | int (px) | `2` | Active card border thickness |
+| `strip_hover_border` | color | `0x80ffffff` | Hovered card border |
+| `strip_hover_border_size` | int (px) | `2` | Hovered card border thickness |
 | `strip_plus_color` | color | `0xd0eef4ff` | The "+" glyph |
 | `shadow_color` | color | `0x70000000` | Window preview drop shadow |
-| `hover_border` | color | `0xf0ffffff` | Hovered window preview outline |
-| `select_border` | color | `0xf066ccff` | Keyboard-selected preview outline |
-| `select_border_size` | int (px) | `3` | Keyboard-selected preview outline thickness |
+| `hover_border` | color | `0xf0ffffff` | Hovered window preview border |
+| `hover_border_size` | int (px) | `3` | Hovered preview border thickness |
+| `select_border` | color | `0xf066ccff` | Keyboard-selected preview border |
+| `select_border_size` | int (px) | `3` | Keyboard-selected preview border thickness |
 | `focus_follows_mouse` | bool (0/1) | `1` | Keyboard selection tracks the hovered preview |
 | `scroll_switches_workspace` | bool (0/1) | `1` | Wheel over the main area steps prev/next workspace |
 | `passthrough_keys` | bool (0/1) | `1` | Let keys the overview doesn't use reach Hyprland (keybinds keep working) |
@@ -195,9 +198,12 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 strip_active_color  = 0x4d1c2c44,
                 strip_active_border = 0xf0ffffff,
                 strip_hover_border  = 0x80ffffff,
+                strip_active_border_size = 2,
+                strip_hover_border_size  = 2,
                 strip_plus_color    = 0xd0eef4ff,
                 shadow_color        = 0x70000000,
                 hover_border        = 0xf0ffffff,
+                hover_border_size   = 3,
             },
         },
     })
@@ -266,9 +272,12 @@ plugin {
         strip_active_color  = 0x4d1c2c44
         strip_active_border = 0xf0ffffff
         strip_hover_border  = 0x80ffffff
+        strip_active_border_size = 2
+        strip_hover_border_size  = 2
         strip_plus_color    = 0xd0eef4ff
         shadow_color        = 0x70000000
         hover_border        = 0xf0ffffff
+        hover_border_size   = 3
     }
 }
 ```

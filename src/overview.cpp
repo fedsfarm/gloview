@@ -21,6 +21,7 @@
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
@@ -81,6 +82,19 @@ CBox pxb(const LRect& r, double s) {
 }
 int pxr(double round, double s) {
     return static_cast<int>(round * s);
+}
+
+// Hollow ring drawn INSIDE `boxPx` and ON TOP of the live surface, so the band overlaps (crops)
+// the window's own edge — like a real Hyprland border, not an outline hugging the tile. A grown
+// renderRect can't do this: it's filled, so on top it hides the window and underneath its arc is
+// eaten by the surface's corners. Hyprland's border shader paints `thick` px inward from the box
+// and discards the interior; `round` is the box's corner radius (it cuts the inside at
+// round - borderSize). Pixel coords (pxb).
+void renderRing(const CBox& boxPx, const CHyprColor& col, double roundPx, double thickPx) {
+    if (thickPx < 1.0 || boxPx.w <= 0.0 || boxPx.h <= 0.0 || col.a <= 0.0)
+        return;
+    const Config::CGradientValueData grad(col);
+    g_pHyprOpenGL->renderBorder(boxPx, grad, {.round = static_cast<int>(roundPx), .roundingPower = 2.F, .borderSize = static_cast<int>(std::round(thickPx)), .a = 1.F});
 }
 
 LRect fitInside(const LRect& outer, double aspect) {
@@ -222,11 +236,12 @@ CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
 
 // Immediate-mode overlay chrome split into phases so the LIVE window surfaces (queued
 // CSurfacePassElements, not immediate GL) layer between the chrome:
-// backdrop+backings (Back) → main surfaces → strip chrome (Mid) → strip surfaces →
-// dragged tile chrome (DragBack) → dragged surface → cursor (Front).
+// backdrop+backings (Back) → main surfaces → preview rings (MainFront) → strip chrome (Mid) →
+// strip surfaces → card rings (StripFront) → dragged tile chrome (DragBack) → dragged surface →
+// drag ring + cursor (Front). Ring phases run AFTER their surfaces (see renderRing).
 class COverlayPass final : public IPassElement {
   public:
-    enum class Phase { Back, Mid, DragBack, Front };
+    enum class Phase { Back, MainFront, Mid, StripFront, DragBack, Front };
     COverlayPass(Overview* o, Phase phase) : m_owner(o), m_phase(phase) {}
 
     std::vector<UP<IPassElement>> draw() override {
@@ -237,9 +252,14 @@ class COverlayPass final : public IPassElement {
                 m_owner->renderBackdrop();
                 m_owner->renderPreviews(); // main tile chrome; surfaces queued right after
                 break;
-            case Phase::Mid: m_owner->renderStrip(); break;          // strip chrome; surfaces queued after
-            case Phase::DragBack: m_owner->renderDragTile(); break;  // dragged tile chrome; surface queued after
-            case Phase::Front: m_owner->renderCursorOnTop(); break;
+            case Phase::MainFront: m_owner->renderPreviewRings(); break; // over the main surfaces
+            case Phase::Mid: m_owner->renderStrip(); break;              // strip chrome; surfaces queued after
+            case Phase::StripFront: m_owner->renderStripRings(); break;  // over the card surfaces
+            case Phase::DragBack: m_owner->renderDragTile(); break;      // dragged tile chrome; surface queued after
+            case Phase::Front:
+                m_owner->renderDragRing(); // over the dragged surface
+                m_owner->renderCursorOnTop();
+                break;
         }
         return {};
     }
@@ -1195,8 +1215,10 @@ void Overview::renderStage(eRenderStage stage) {
     auto& pass = g_pHyprRenderer->m_renderPass;
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Back));
     renderMainWindows();
+    pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::MainFront));
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Mid));
     renderStripWindows();
+    pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::StripFront));
     const bool dragging = m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size());
     if (dragging) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
@@ -1255,38 +1277,19 @@ void Overview::renderStrip() const {
     const int  cardRound  = cfgInt("plugin:gloview:strip_card_round", 10);
     const auto cardBg     = argb(cfgColor("plugin:gloview:strip_card_color", 0x3a0e131c), e);
     const auto activeBg   = argb(cfgColor("plugin:gloview:strip_active_color", 0x4d1c2c44), e);
-    const auto activeLine = argb(cfgColor("plugin:gloview:strip_active_border", 0xf0ffffff), e);
-    const auto hoverLine  = argb(cfgColor("plugin:gloview:strip_hover_border", 0x80ffffff), e);
     const auto plusCol    = argb(cfgColor("plugin:gloview:strip_plus_color", 0xd0eef4ff), e);
     // Expo indicator: when all-workspaces is active, the "All" card (if present) lights up
-    // active-style; otherwise outline every real card for feedback. The live workspace keeps
-    // its activeBg fill either way.
+    // active-style. The live workspace keeps its activeBg fill either way.
     const bool allWs       = showAllWorkspaces();
     const bool allCardShown = cfgInt("plugin:gloview:strip_all_card", 0) != 0;
 
     for (size_t i = 0; i < m_strip.size(); ++i) {
         const auto&  it     = m_strip[i];
-        const bool   hover  = static_cast<int>(i) == m_hoveredStrip;
-        LRect        card   = it.card;
-        card.x += slide.x + scroll.x; // follow the strip slide-in and scroll
-        card.y += slide.y + scroll.y;
-        if (m_newCardAnim && it.id == m_newCardId && !it.isPlus && !it.isAll) {
-            const double f  = newCardScale(); // pop-in: scale up from the card center
-            const double cx = card.cx(), cy = card.cy();
-            card = LRect{cx - card.w * f / 2.0, cy - card.h * f / 2.0, card.w * f, card.h * f};
-        }
+        const LRect  card   = stripCardBox(i, slide, scroll);
         const CBox   c      = box(card);
 
-        // border frame underlay: one rounded rect grown by the line width, so the card body
-        // on top leaves a clean ring (four thin strips would blob at the corners).
+        // card rings are drawn later, over the live card previews (renderStripRings)
         const bool actLike = it.active || (allWs && allCardShown && it.isAll); // filled + thick ring
-        const bool expoRing = allWs && !allCardShown && !it.isPlus;            // outline-all fallback
-        const bool ring     = actLike || expoRing;
-        if (ring || hover) {
-            const auto&  lc = ring ? activeLine : hoverLine;
-            const double t  = actLike ? 2.5 : 2.0;
-            g_pHyprOpenGL->renderRect(pxb(CBox(c.x - t, c.y - t, c.w + 2 * t, c.h + 2 * t), s), lc, {.round = pxr(cardRound + t, s)});
-        }
 
         g_pHyprOpenGL->renderRect(pxb(c, s), actLike ? activeBg : cardBg, {.round = pxr(cardRound, s)});
 
@@ -1383,6 +1386,54 @@ void Overview::renderStripWindows() const {
     }
 }
 
+// One card's on-screen box: base slot + strip slide-in + card-group scroll + the add-workspace
+// pop-in. Shared by the card chrome and its ring so they can't drift apart.
+LRect Overview::stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const {
+    const auto& it   = m_strip[i];
+    LRect       card = it.card;
+    card.x += slide.x + scroll.x;
+    card.y += slide.y + scroll.y;
+    if (m_newCardAnim && it.id == m_newCardId && !it.isPlus && !it.isAll) {
+        const double f  = newCardScale(); // pop-in: scale up from the card center
+        const double cx = card.cx(), cy = card.cy();
+        card = LRect{cx - card.w * f / 2.0, cy - card.h * f / 2.0, card.w * f, card.h * f};
+    }
+    return card;
+}
+
+// Active / hover / expo card rings, drawn OVER the cards' live window previews.
+void Overview::renderStripRings() const {
+    const auto m = m_monitor.lock();
+    if (!m || m_strip.empty())
+        return;
+    const double e = eased();
+    if (e <= 0.01)
+        return;
+    const double   s          = m->m_scale;
+    const Vector2D slide      = stripSlide(e);
+    const Vector2D scroll     = stripScroll();
+    const int      cardRound  = cfgInt("plugin:gloview:strip_card_round", 10);
+    const auto     activeLine = argb(cfgColor("plugin:gloview:strip_active_border", 0xf0ffffff), e);
+    const auto     hoverLine  = argb(cfgColor("plugin:gloview:strip_hover_border", 0x80ffffff), e);
+    const double   activeSize = std::max(1, cfgInt("plugin:gloview:strip_active_border_size", 2));
+    const double   hoverSize  = std::max(1, cfgInt("plugin:gloview:strip_hover_border_size", 2));
+    const bool     allWs        = showAllWorkspaces();
+    const bool     allCardShown = cfgInt("plugin:gloview:strip_all_card", 0) != 0;
+
+    for (size_t i = 0; i < m_strip.size(); ++i) {
+        const auto& it       = m_strip[i];
+        const bool  hover    = static_cast<int>(i) == m_hoveredStrip;
+        const bool  actLike  = it.active || (allWs && allCardShown && it.isAll);
+        const bool  expoRing = allWs && !allCardShown && !it.isPlus; // outline-all fallback
+        const bool  ring     = actLike || expoRing;
+        if (!ring && !hover)
+            continue;
+        const auto&  lc = ring ? activeLine : hoverLine;
+        const double t  = ring ? activeSize : hoverSize;
+        renderRing(pxb(stripCardBox(i, slide, scroll), s), lc, cardRound * s, t * s);
+    }
+}
+
 // Top-right "✕" hit/draw rect for a tile's content box (desktop mode). One formula so the
 // drawn button and the click target can't disagree.
 LRect Overview::closeButtonRect(const LRect& lb) const {
@@ -1400,7 +1451,6 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     const double e         = eased();
     const int    round     = cfgInt("plugin:gloview:preview_round", 12);
     const auto   shadowCol = argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0);
-    const auto   hoverCol  = argb(cfgColor("plugin:gloview:hover_border", 0xf0ffffff), e);
 
     const auto& t = m_tiles[i];
     const auto  w = t.win.lock();
@@ -1417,21 +1467,10 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     const double dy    = lift ? 14.0 : 6.0;
     g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + dy, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(range * s), shadowCol, e * 0.9);
 
-    const bool   framed   = (static_cast<int>(i) == m_hovered || lift);
-    const bool   selected = (static_cast<int>(i) == m_selected) && !lift; // keyboard-nav cursor
-    const double th       = 3.0;
+    const bool framed   = (static_cast<int>(i) == m_hovered || lift);
+    const bool selected = (static_cast<int>(i) == m_selected) && !lift; // keyboard-nav cursor
 
-    // border underlay grown by the line width; the live surface on top (exactly lb) leaves a
-    // clean ring. Hover ring takes precedence over the coincident keyboard selection ring.
-    if (framed) {
-        const CBox c = box(lb);
-        g_pHyprOpenGL->renderRect(pxb(CBox(c.x - th, c.y - th, c.w + 2 * th, c.h + 2 * th), s), hoverCol, {.round = pxr(round + th, s)});
-    } else if (selected) {
-        const auto   selCol = argb(cfgColor("plugin:gloview:select_border", 0xf066ccff), e);
-        const double st     = std::max(1, cfgInt("plugin:gloview:select_border_size", 3));
-        const CBox   c      = box(lb);
-        g_pHyprOpenGL->renderRect(pxb(CBox(c.x - st, c.y - st, c.w + 2 * st, c.h + 2 * st), s), selCol, {.round = pxr(round + st, s)});
-    }
+    // the hover/select ring is drawn later, on top of the live surface (drawPreviewRing)
 
     // opaque backing under the live surface (transparent clients would leak the blurred
     // backdrop). INSET 1px: backing is a logical rect (rounded OUTWARD), surface is clipped in
@@ -1464,6 +1503,46 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
         g_pHyprOpenGL->renderRect(pxb(CBox(px, py, pw, ph), s), argb(0xcc11151c, e), {.round = pxr(ph / 2.0, s)});
         g_pHyprOpenGL->renderTexture(t.label, pxb(CBox(px + padX, py + padY, lw, lh), s), {.a = static_cast<float>(e)});
     }
+}
+
+// Hover / keyboard-selection ring for one tile, drawn OVER its live surface. Hover wins over the
+// coincident selection ring.
+void Overview::drawPreviewRing(size_t i, const LRect& slot, bool lift) const {
+    const auto m = m_monitor.lock();
+    if (!m || i >= m_tiles.size())
+        return;
+    const auto w = m_tiles[i].win.lock();
+    if (!w || !w->m_isMapped || w->isHidden())
+        return;
+
+    const bool framed   = (static_cast<int>(i) == m_hovered || lift);
+    const bool selected = (static_cast<int>(i) == m_selected) && !lift;
+    if (!framed && !selected)
+        return;
+
+    const double s     = m->m_scale;
+    const double e     = eased();
+    const double round = cfgInt("plugin:gloview:preview_round", 12);
+    const double th    = framed ? std::max(1, cfgInt("plugin:gloview:hover_border_size", 3)) : std::max(1, cfgInt("plugin:gloview:select_border_size", 3));
+    const auto   col   = framed ? argb(cfgColor("plugin:gloview:hover_border", 0xf0ffffff), e) : argb(cfgColor("plugin:gloview:select_border", 0xf066ccff), e);
+
+    renderRing(pxb(tileContentBox(i, slot), s), col, round * s, th * s);
+}
+
+void Overview::renderPreviewRings() const {
+    const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        if (static_cast<int>(i) == dragIdx)
+            continue;
+        drawPreviewRing(i, currentBox(m_tiles[i], static_cast<int>(i)), false);
+    }
+}
+
+void Overview::renderDragRing() const {
+    const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+    if (dragIdx < 0)
+        return;
+    drawPreviewRing(static_cast<size_t>(dragIdx), dragBox(), true);
 }
 
 // Fit `slot` to the window's real aspect so the live surface fills it exactly (uniform scale).

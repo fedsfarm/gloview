@@ -76,10 +76,13 @@ class Overview {
     void renderBackdrop() const;
     void renderStrip() const;
     void renderStripWindows() const; // live window surfaces inside the strip cards
-    void renderPreviews() const;  // static tiles' chrome (shadow/border/backing), drawn under the strip
+    void renderStripRings() const;  // card active/hover rings, over the card previews
+    void renderPreviews() const;  // static tiles' chrome (shadow/backing/title), drawn under the strip
     void renderMainWindows() const; // live window surfaces for the main-area tiles
+    void renderPreviewRings() const; // tile hover/selection rings, over the main surfaces
     void renderDragTile() const;  // the picked-up tile's chrome, drawn over the strip
     void renderDragWindow() const; // the picked-up tile's live surface
+    void renderDragRing() const;  // the picked-up tile's ring, over its surface
     void renderCursorOnTop() const; // redraw the SW cursor over our overlay
     bool isAboveLayer(const std::string& ns) const;
     void renderAboveLayers() const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
@@ -239,7 +242,9 @@ class Overview {
     LRect  currentBox(const Tile& t, int i) const; // lerped natural->target, staggered + overshoot
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
-    void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/border/backing/title)
+    void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/backing/title)
+    void   drawPreviewRing(size_t i, const LRect& slot, bool lift) const; // hover/selection ring, over the live surface
+    LRect  stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const; // card box incl. scroll + pop-in
     void   switchToWorkspace(const StripItem& it);
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)

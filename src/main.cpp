@@ -132,6 +132,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:strip_plus_color", Config::INTEGER{0xd0eef4ffLL});
     addColor("plugin:gloview:shadow_color", Config::INTEGER{0x70000000LL});
     addColor("plugin:gloview:hover_border", Config::INTEGER{0xf0ffffffLL});
+    addInt("plugin:gloview:hover_border_size", Config::INTEGER{3});         // hovered preview ring thickness (px)
+    addInt("plugin:gloview:strip_active_border_size", Config::INTEGER{2});  // active/expo card ring thickness (px)
+    addInt("plugin:gloview:strip_hover_border_size", Config::INTEGER{2});   // hovered card ring thickness (px)
 
     // --- input / keyboard navigation ---
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
