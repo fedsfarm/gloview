@@ -89,12 +89,18 @@ int pxr(double round, double s) {
 // renderRect can't do this: it's filled, so on top it hides the window and underneath its arc is
 // eaten by the surface's corners. Hyprland's border shader paints `thick` px inward from the box
 // and discards the interior; `round` is the box's corner radius (it cuts the inside at
-// round - borderSize). Pixel coords (pxb).
-void renderRing(const CBox& boxPx, const CHyprColor& col, double roundPx, double thickPx) {
-    if (thickPx < 1.0 || boxPx.w <= 0.0 || boxPx.h <= 0.0 || col.a <= 0.0)
+// round - borderSize). Box/round in pixel coords (pxb); `thickLg` in LOGICAL px, because
+// renderBorder scales borderSize by the monitor scale itself.
+// The box MUST be snapped to the pixel grid: the border shader quantizes each edge's thickness
+// independently from interpolated fragment distances (`smallest > thick` on pixel centers), so a
+// fractional edge renders one px thicker/thinner than the others.
+void renderRing(const CBox& boxPx, const CHyprColor& col, double roundPx, double thickLg) {
+    if (thickLg < 1.0 || boxPx.w <= 0.0 || boxPx.h <= 0.0 || col.a <= 0.0)
         return;
+    CBox snapped = boxPx;
+    snapped.round();
     const Config::CGradientValueData grad(col);
-    g_pHyprOpenGL->renderBorder(boxPx, grad, {.round = static_cast<int>(roundPx), .roundingPower = 2.F, .borderSize = static_cast<int>(std::round(thickPx)), .a = 1.F});
+    g_pHyprOpenGL->renderBorder(snapped, grad, {.round = static_cast<int>(roundPx), .roundingPower = 2.F, .borderSize = static_cast<int>(std::round(thickLg)), .a = 1.F});
 }
 
 LRect fitInside(const LRect& outer, double aspect) {
@@ -1430,7 +1436,7 @@ void Overview::renderStripRings() const {
             continue;
         const auto&  lc = ring ? activeLine : hoverLine;
         const double t  = ring ? activeSize : hoverSize;
-        renderRing(pxb(stripCardBox(i, slide, scroll), s), lc, cardRound * s, t * s);
+        renderRing(pxb(stripCardBox(i, slide, scroll), s), lc, cardRound * s, t);
     }
 }
 
@@ -1526,7 +1532,7 @@ void Overview::drawPreviewRing(size_t i, const LRect& slot, bool lift) const {
     const double th    = framed ? std::max(1, cfgInt("plugin:gloview:hover_border_size", 3)) : std::max(1, cfgInt("plugin:gloview:select_border_size", 3));
     const auto   col   = framed ? argb(cfgColor("plugin:gloview:hover_border", 0xf0ffffff), e) : argb(cfgColor("plugin:gloview:select_border", 0xf066ccff), e);
 
-    renderRing(pxb(tileContentBox(i, slot), s), col, round * s, th * s);
+    renderRing(pxb(tileContentBox(i, slot), s), col, round * s, th);
 }
 
 void Overview::renderPreviewRings() const {
