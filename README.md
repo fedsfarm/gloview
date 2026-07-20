@@ -284,12 +284,14 @@ plugin {
 
 ## Donate
 
-#### BTC:
-`bc1p2xkwf9elq8wgajtq2cc6zthuh4k998tgnk6365cnjqgal7mpd09q4jtfq8`  
-#### ETH:
-`0xBD636eBD3a6b9F046930101657459E90DA370e81`  
 #### XMR:
 `42uxSBp4aMyTAsPCMGEwHvJyGpemr1c7kdjtFsD5tnEsU7XsnYMjseyXBzLWHkruSWFGbQWagsh31bBRdU7vDNUBAzm1Mo4`  
+
+#### BTC:
+`bc1p2xkwf9elq8wgajtq2cc6zthuh4k998tgnk6365cnjqgal7mpd09q4jtfq8`
+
+#### ETH (ERC-20):
+`0xBD636eBD3a6b9F046930101657459E90DA370e81`  
 
 ---
 
