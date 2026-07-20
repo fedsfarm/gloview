@@ -291,4 +291,6 @@ plugin {
 #### XMR:
 `42uxSBp4aMyTAsPCMGEwHvJyGpemr1c7kdjtFsD5tnEsU7XsnYMjseyXBzLWHkruSWFGbQWagsh31bBRdU7vDNUBAzm1Mo4`  
 
+---
+
 Email [root@feds.farm](mailto:root@feds.farm) or DM [@root:feds.farm](https://escape.feds.farm/#@root:feds.farm) on Matrix if you want your donation to be visible
