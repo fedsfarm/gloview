@@ -1,5 +1,5 @@
 # GloView
-[![license](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/fedsfarm/gloview/blob/main/LICENSE) [![#main:feds.farm](https://escape.feds.farm/feds.png)](https://escape.feds.farm/#main:feds.farm)
+[![license](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/fedsfarm/gloview/blob/main/LICENSE) [![Matrix](https://img.shields.io/badge/Matrix-Join%20chat-green?logo=matrix&logoColor=white)](https://escape.feds.farm/#main:feds.farm) [![Donate](https://img.shields.io/badge/Donate-XMR%20%C2%B7%20BTC%20%C2%B7%20ETH-orange?logo=monero&logoColor=white&labelColor=555)](#donate)
 
 https://github.com/user-attachments/assets/0a3d812a-eae0-4ca5-8698-7a006e540857
 
