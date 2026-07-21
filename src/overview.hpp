@@ -21,6 +21,7 @@
 
 namespace Render {
 class ITexture;
+class IFramebuffer;
 }
 
 #include "layout.hpp"
@@ -162,6 +163,11 @@ class Overview {
     // stale-size buffer) reuse its last good snapshot instead of re-snapshotting into a
     // stretched/black thumbnail. Persists across the per-open tile/strip rebuilds.
     std::unordered_map<void*, LRect>      m_snapGeom;
+    // window* -> the framebuffer makeSnapshotFB() handed us for it. 0.56 dropped
+    // CWindow::m_snapshotFB, so the plugin holds the FB itself; we never sample it (tiles
+    // render the live surface), it only answers "is there already a good snapshot?".
+    // Stale keys are pruned each capture pass and the whole map is dropped on teardown.
+    std::unordered_map<void*, SP<Render::IFramebuffer>> m_snapFB;
     // layer surfaces (bars/popups) we faded out while up, with their pre-hide alpha
     // goal, so deactivate() restores them exactly — even if config changed meanwhile.
     std::vector<std::pair<PHLLSREF, float>> m_hiddenLayers;

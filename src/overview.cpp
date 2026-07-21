@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <unordered_set>
 #include <utility>
 
 #include <hyprland/src/Compositor.hpp>
@@ -11,13 +12,18 @@
 #include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/state/GlobalWindowController.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/managers/PointerManager.hpp>
+#include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
@@ -25,6 +31,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
 #include <hyprland/src/render/pass/RendererHintsPassElement.hpp>
@@ -142,8 +149,8 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     // SETTLED goal() geometry, not mid-animation value(): destPx is sized from goal(), so
     // scaling by value() mid-resize fills only part of the box → black side strips. Position
     // cancels in the translate remap below, so only size matters.
-    const auto pos      = w->m_realPosition->goal();
-    const auto size     = w->m_realSize->goal();
+    const auto pos      = w->positionAnimation()->goal();
+    const auto size     = w->sizeAnimation()->goal();
     const float logicalW = std::max((float)size.x, 5.F);
     const float logicalH = std::max((float)size.y, 5.F);
     // Over-cover the slot (fill BOTH axes via max + ~1.5px pad), don't just fit it: a
@@ -183,7 +190,7 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     data.w              = std::max(size.x, 5.0);
     data.h              = std::max(size.y, 5.0);
     data.surface        = w->wlSurface()->resource();
-    data.dontRound      = w->isEffectiveInternalFSMode(FSMODE_FULLSCREEN);
+    data.dontRound      = Fullscreen::controller()->getFullscreenModes(w).internal == Fullscreen::FSMODE_FULLSCREEN;
     data.fadeAlpha      = 1.F;
     data.alpha          = std::clamp(alpha, 0.F, 1.F);
     data.decorate       = false;
@@ -316,6 +323,8 @@ Overview::~Overview() {
     m_newWs.reset();
     m_tiles.clear();
     m_strip.clear();
+    m_snapFB.clear(); // release the snapshot framebuffers we own since 0.56
+    m_snapGeom.clear();
     if (m_recaptureTimer && g_pEventLoopManager) {
         m_recaptureTimer->cancel();
         g_pEventLoopManager->removeTimer(m_recaptureTimer);
@@ -357,13 +366,20 @@ bool Overview::initialize() {
     const auto matches = HyprlandAPI::findFunctionsByName(m_handle, "shouldRenderWindow");
     void*      addr    = nullptr;
     void*      addrAny = nullptr;
+    // Match on arity, not on the full parameter spelling: Hyprland keeps re-namespacing the
+    // argument types (0.55 CWindow -> Desktop::View::CWindow, 0.56 CMonitor -> Monitor::CMonitor)
+    // and every rename silently nulled the address, failing init on an ABI bump. The one-arg
+    // overload takes the window, the two-arg one takes (window, monitor) — that's stable.
+    const std::string kPrefix = "shouldRenderWindow(";
     for (const auto& mt : matches) {
-        if (mt.demangled.find("shouldRenderWindow(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, "
-                              "Hyprutils::Memory::CSharedPointer<CMonitor>)") != std::string::npos) {
-            addr = mt.address;
-        } else if (mt.demangled.find("shouldRenderWindow(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>)") != std::string::npos) {
-            addrAny = mt.address;
-        }
+        const auto argsAt = mt.demangled.find(kPrefix);
+        if (argsAt == std::string::npos)
+            continue;
+        const auto args = mt.demangled.substr(argsAt + kPrefix.length());
+        if (args.find(',') != std::string::npos)
+            addr = mt.address; // (window, monitor)
+        else
+            addrAny = mt.address; // (window)
     }
     if (!addr) {
         HyprlandAPI::addNotification(m_handle, "[gloview] could not find shouldRenderWindow to hook", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
@@ -559,7 +575,7 @@ void Overview::open() {
     if (m_active && m_opening)
         return;
 
-    const auto m = g_pCompositor->getMonitorFromCursor();
+    const auto m = State::monitorState()->query().vec(Pointer::mgr()->position()).run();
     if (!m || !m->m_activeWorkspace)
         return;
 
@@ -624,8 +640,8 @@ void Overview::close() {
     if (const auto m = m_monitor.lock()) {
         for (auto& t : m_tiles) {
             if (const auto w = t.win.lock()) {
-                const auto p = w->m_realPosition->goal();
-                const auto s = w->m_realSize->goal();
+                const auto p = w->positionAnimation()->goal();
+                const auto s = w->sizeAnimation()->goal();
                 t.natural    = LRect{p.x - m->m_position.x, p.y - m->m_position.y, std::max(1.0, s.x), std::max(1.0, s.y)};
             }
         }
@@ -672,6 +688,8 @@ void Overview::hardClose() {
     m_tiles.clear();
     m_strip.clear();
     m_canvasPos.clear();
+    m_snapFB.clear(); // release the snapshot framebuffers we own since 0.56
+    m_snapGeom.clear();
     m_hovered = m_hoveredStrip = -1;
     m_selected                 = -1;
 
@@ -712,7 +730,7 @@ void Overview::buildTiles() {
 
     // Off-workspace windows (expo) render live from their last-committed texture, same as
     // the strip cards. Membership shared with syncTiles via tileBelongs().
-    for (const auto& w : g_pCompositor->m_windows) {
+    for (const auto& w : Desktop::windowState()->windows()) {
         if (!tileBelongs(w, m, ws))
             continue;
 
@@ -720,8 +738,8 @@ void Overview::buildTiles() {
         t.win = w;
         // settled goal(), not value(): a mid-desktop-jump value() carries the workspace-slide
         // offset and would warp every preview.
-        const auto p = w->m_realPosition->goal();
-        const auto s = w->m_realSize->goal();
+        const auto p = w->positionAnimation()->goal();
+        const auto s = w->sizeAnimation()->goal();
         t.natural    = LRect{p.x - m->m_position.x, p.y - m->m_position.y, std::max(1.0, s.x), std::max(1.0, s.y)};
         t.snapSource = t.natural; // refined to the live frozen rect in captureSnapshots()
         m_tiles.push_back(t);
@@ -758,14 +776,14 @@ void Overview::buildStrip() {
     const bool showEmpty   = cfgInt("plugin:gloview:show_empty", 1) != 0;
     const bool showSpecial = cfgInt("plugin:gloview:show_special", 0) != 0;
     const auto wsHasWindows = [](const PHLWORKSPACE& w) {
-        for (const auto& win : g_pCompositor->m_windows)
+        for (const auto& win : Desktop::windowState()->windows())
             if (win && win->m_isMapped && !win->isHidden() && win->m_workspace == w)
                 return true;
         return false;
     };
 
     std::vector<PHLWORKSPACE> wss;
-    for (const auto& wref : g_pCompositor->getWorkspaces()) {
+    for (const auto& wref : State::workspaceState()->workspaces()) {
         const auto ws = wref.lock();
         if (!ws || ws->m_monitor.lock() != m)
             continue;
@@ -802,11 +820,11 @@ void Overview::buildStrip() {
         it.ws     = ws;
         it.id     = ws->m_id;
         it.active = (ws == cur);
-        for (const auto& w : g_pCompositor->m_windows) {
+        for (const auto& w : Desktop::windowState()->windows()) {
             if (!w || !w->m_isMapped || w->isHidden() || w->m_workspace != ws)
                 continue;
-            const auto p = w->m_realPosition->goal();
-            const auto s = w->m_realSize->goal();
+            const auto p = w->positionAnimation()->goal();
+            const auto s = w->sizeAnimation()->goal();
             StripWin sw;
             sw.win = w;
             sw.rel = LRect{(p.x - m->m_position.x) / m->m_size.x, (p.y - m->m_position.y) / m->m_size.y, s.x / m->m_size.x, s.y / m->m_size.y};
@@ -1015,7 +1033,11 @@ void Overview::captureSnapshots() {
             // force-render this exact window through the hook for makeSnapshot's duration,
             // so an inactive-workspace window still paints into its FB.
             m_captureWin = w;
-            g_pHyprRenderer->makeSnapshot(w);
+            // 0.56: the FB is no longer parked on the window (CWindow::m_snapshotFB is gone),
+            // makeSnapshotFB hands it back to the caller — keep it so the "do we already have
+            // a good snapshot?" test below still works. Dropped in clearSnapshots().
+            if (const auto fb = g_pHyprRenderer->makeSnapshotFB(w))
+                m_snapFB[w.get()] = fb;
             m_captureWin.reset();
 
             ws->m_visible        = wsVis;
@@ -1039,12 +1061,13 @@ void Overview::captureSnapshots() {
         if (!w)
             return LRect{0, 0, 0, 0};
         void* const    key  = w.get();
-        const Vector2D gp   = w->m_realPosition->goal();
-        const Vector2D gs   = w->m_realSize->goal();
-        const Vector2D vp   = w->m_realPosition->value();
-        const Vector2D vs   = w->m_realSize->value();
+        const Vector2D gp   = w->positionAnimation()->goal();
+        const Vector2D gs   = w->sizeAnimation()->goal();
+        const Vector2D vp   = w->positionAnimation()->value();
+        const Vector2D vs   = w->sizeAnimation()->value();
         const bool settled  = roughly(vp.x, gp.x, 2) && roughly(vp.y, gp.y, 2) && roughly(vs.x, gs.x, 2) && roughly(vs.y, gs.y, 2);
-        const bool haveFB   = w->m_snapshotFB && w->m_snapshotFB->isAllocated();
+        const auto fbIt     = m_snapFB.find(key);
+        const bool haveFB   = fbIt != m_snapFB.end() && fbIt->second && fbIt->second->isAllocated();
         // renderWindow scales the surface DOWN to fit the box but never UP, so content spans
         // min(box, buffer): when the buffer lags the box (retiled/grown, or any window on a
         // HIDDEN workspace — no frame callbacks) the margin stays transparent. Crop to the
@@ -1061,9 +1084,9 @@ void Overview::captureSnapshots() {
             return r;
         };
 
-        // Always RE-snapshot a settled window, never trust a kept FB: m_snapshotFB is SHARED
-        // with Hyprland, whose own switch/fade animations re-render the window into it at a
-        // different geometry, desyncing a reused crop rect → blank/dark thumbs. A fresh snap
+        // Always RE-snapshot a settled window, never trust a kept FB: the window's geometry
+        // may have moved under the recorded crop rect since (a switch/fade re-render at a
+        // different box), desyncing rect from content → blank/dark thumbs. A fresh snap
         // re-renders and re-records the rect together, so they can't disagree.
         if (settled && snap(w))
             return record();
@@ -1077,6 +1100,17 @@ void Overview::captureSnapshots() {
             return record();
         return LRect{0, 0, 0, 0};
     };
+
+    // The snapshot maps are keyed by raw window pointer and outlive a close on purpose, but
+    // now that WE own the framebuffers a dead window's entry pins GPU memory forever. Drop
+    // every key that no longer names a live window before adding this pass's.
+    {
+        std::unordered_set<void*> live;
+        for (const auto& w : Desktop::windowState()->windows())
+            live.insert(w.get());
+        std::erase_if(m_snapFB, [&](const auto& e) { return !live.contains(e.first); });
+        std::erase_if(m_snapGeom, [&](const auto& e) { return !live.contains(e.first); });
+    }
 
     m_capturing = true; // let hidden tile windows render into their snapshots
     g_pHyprOpenGL->makeEGLCurrent();
@@ -1094,8 +1128,8 @@ void Overview::captureSnapshots() {
             const auto w = sw.win.lock();
             if (!w)
                 continue;
-            const auto gp = w->m_realPosition->goal();
-            const auto gs = w->m_realSize->goal();
+            const auto gp = w->positionAnimation()->goal();
+            const auto gs = w->sizeAnimation()->goal();
             sw.rel = LRect{(gp.x - m->m_position.x) / m->m_size.x, (gp.y - m->m_position.y) / m->m_size.y,
                            std::max(0.001, gs.x / m->m_size.x), std::max(0.001, gs.y / m->m_size.y)};
         }
@@ -1562,7 +1596,7 @@ LRect Overview::tileContentBox(size_t i, const LRect& slot) const {
     double aspect = slot.w / std::max(1.0, slot.h);
     if (i < m_tiles.size()) {
         if (const auto w = m_tiles[i].win.lock()) {
-            const auto s = w->m_realSize->goal();
+            const auto s = w->sizeAnimation()->goal();
             if (s.x > 0 && s.y > 0)
                 aspect = s.x / s.y;
         }
@@ -1683,8 +1717,8 @@ void Overview::renderAboveLayers() const {
             if (!isAboveLayer(ls->m_namespace))
                 continue;
 
-            const auto pos  = ls->m_realPosition->value(); // absolute logical (layout) coords
-            const auto size = ls->m_realSize->value();
+            const auto pos  = ls->positionAnimation()->value(); // absolute logical (layout) coords
+            const auto size = ls->sizeAnimation()->value();
             if (!(size.x > 0 && size.y > 0))
                 continue;
 
@@ -1724,12 +1758,12 @@ void Overview::renderCursorOnTop() const {
     // Hyprland composites the software cursor before our RENDER_LAST_MOMENT pass, so the
     // backdrop paints over it. Redraw on top so the pointer stays visible while up.
     const auto m = m_monitor.lock();
-    if (!m || !g_pPointerManager || !g_pHyprOpenGL)
+    if (!m || !Pointer::mgr() || !g_pHyprOpenGL)
         return;
-    const auto tex = g_pPointerManager->getCurrentCursorTexture();
+    const auto tex = Pointer::mgr()->getCurrentCursorTexture();
     if (!tex)
         return;
-    const CBox g  = g_pPointerManager->getCursorBoxGlobal();
+    const CBox g  = Pointer::mgr()->getCursorBoxGlobal();
     const CBox lb(g.x - m->m_position.x, g.y - m->m_position.y, g.w, g.h);
     g_pHyprOpenGL->renderTexture(tex, pxb(lb, m->m_scale), {.a = 1.0F});
 }
@@ -1992,9 +2026,9 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
     PHLWORKSPACE target;
     if (it.isPlus) {
         int id = 1;
-        while (g_pCompositor->getWorkspaceByID(id))
+        while (State::workspaceState()->query().id(id).run())
             ++id;
-        target         = g_pCompositor->createNewWorkspace(id, m->m_id);
+        target         = State::workspaceState()->create(id, m->m_id);
         m_newCardId    = id; // pop the new card in
         m_newCardStart = std::chrono::steady_clock::now();
         m_newCardAnim  = true;
@@ -2014,7 +2048,7 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
             oldBoxes.emplace_back(win, currentBox(m_tiles[i], static_cast<int>(i)));
     }
 
-    g_pCompositor->moveWindowToWorkspaceSafe(w, target);
+    Desktop::globalWindowController()->moveWindowToWorkspace(w, target);
 
     // switch_on_drop: follow the window to its new workspace instead of staying put.
     if (cfgInt("plugin:gloview:switch_on_drop", 0) != 0) {
@@ -2045,7 +2079,7 @@ void Overview::swapTiles(int a, int b) {
     const auto wb = m_tiles[b].win.lock();
     // only swap two real windows on the SAME workspace; fullscreen or a cross-workspace
     // pair (expo) has no well-defined tiled slot to trade — else snap the drag back.
-    if (!wa || !wb || wa == wb || wa->m_workspace != wb->m_workspace || wa->isFullscreen() || wb->isFullscreen()) {
+    if (!wa || !wb || wa == wb || wa->m_workspace != wb->m_workspace || Fullscreen::controller()->isFullscreen(wa) || Fullscreen::controller()->isFullscreen(wb)) {
         damage();
         return;
     }
@@ -2085,9 +2119,9 @@ void Overview::switchToWorkspace(const StripItem& it) {
     PHLWORKSPACE ws;
     if (it.isPlus) {
         int id = 1;
-        while (g_pCompositor->getWorkspaceByID(id))
+        while (State::workspaceState()->query().id(id).run())
             ++id;
-        ws = g_pCompositor->createNewWorkspace(id, m->m_id, "", false);
+        ws = State::workspaceState()->create(id, m->m_id, "", false);
         if (!ws)
             return;
     } else if (const auto target = it.ws.lock()) {
@@ -2454,7 +2488,7 @@ void Overview::syncTiles() {
     const auto m       = m_monitor.lock();
     const auto belongs = [&](const PHLWINDOW& w) { return tileBelongs(w, m, ws); };
     size_t expected = 0;
-    for (const auto& w : g_pCompositor->m_windows)
+    for (const auto& w : Desktop::windowState()->windows())
         if (belongs(w))
             ++expected;
 
@@ -2530,12 +2564,12 @@ void Overview::hideLayers() {
     const auto fade = [this](const std::vector<PHLLSREF>& layer) {
         for (const auto& ref : layer) {
             const auto ls = ref.lock();
-            if (!ls || !ls->m_alpha)
+            if (!ls || !ls->alpha()[Desktop::View::LS_ALPHA_FADE])
                 continue;
             if (isAboveLayer(ls->m_namespace))
                 continue; // keep above-overview surfaces fully visible
-            m_hiddenLayers.emplace_back(ref, ls->m_alpha->goal());
-            *ls->m_alpha = 0.F;
+            m_hiddenLayers.emplace_back(ref, ls->alpha()[Desktop::View::LS_ALPHA_FADE]->goal());
+            *ls->alpha()[Desktop::View::LS_ALPHA_FADE] = 0.F;
         }
     };
     if (top)
@@ -2550,8 +2584,8 @@ void Overview::hideLayers() {
 
 void Overview::restoreLayers() {
     for (auto& [ref, alpha] : m_hiddenLayers)
-        if (const auto ls = ref.lock(); ls && ls->m_alpha)
-            *ls->m_alpha = alpha;
+        if (const auto ls = ref.lock(); ls && ls->alpha()[Desktop::View::LS_ALPHA_FADE])
+            *ls->alpha()[Desktop::View::LS_ALPHA_FADE] = alpha;
     m_hiddenLayers.clear();
 }
 
@@ -2560,7 +2594,7 @@ void Overview::restoreLayers() {
 // bars). Hyprland never sets this flag, so a blanket reset to false restores normal
 // rendering — no per-surface tracking. Guarded in deactivate()/hardClose()/dtor.
 void Overview::restoreFill() {
-    for (const auto& w : g_pCompositor->m_windows)
+    for (const auto& w : Desktop::windowState()->windows())
         if (w && w->wlSurface())
             w->wlSurface()->m_fillIgnoreSmall = false;
 }
@@ -2572,9 +2606,9 @@ void Overview::addWorkspace() {
     if (!m)
         return;
     int id = 1;
-    while (g_pCompositor->getWorkspaceByID(id))
+    while (State::workspaceState()->query().id(id).run())
         ++id;
-    const auto ws = g_pCompositor->createNewWorkspace(id, m->m_id, "", false);
+    const auto ws = State::workspaceState()->create(id, m->m_id, "", false);
     if (!ws)
         return;
     // A new empty workspace is reaped within a frame or two unless focused. Hold it
@@ -2606,7 +2640,7 @@ void Overview::closeWorkspaceWindows(const StripItem& it) {
     if (!ws)
         return;
     int n = 0;
-    for (const auto& w : g_pCompositor->m_windows)
+    for (const auto& w : Desktop::windowState()->windows())
         if (w && w->m_isMapped && !w->isHidden() && w->m_workspace == ws) {
             w->sendClose();
             ++n;
