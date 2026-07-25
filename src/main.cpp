@@ -67,6 +67,29 @@ SDispatchResult dispAllWorkspaces(std::string) {
         g_overview->toggleAllWorkspaces();
     return {.success = true};
 }
+SDispatchResult dispNext(std::string) {
+    if (g_overview)
+        g_overview->nextWorkspace();
+    return {.success = true};
+}
+SDispatchResult dispPrev(std::string) {
+    if (g_overview)
+        g_overview->prevWorkspace();
+    return {.success = true};
+}
+// gloview:setworkspace <id> — show that workspace in the overview.
+SDispatchResult dispSetWorkspace(std::string arg) {
+    if (!g_overview)
+        return {.success = true};
+    try {
+        const int id = std::stoi(arg);
+        if (!g_overview->setWorkspace(id))
+            return {.success = false, .error = "gloview: no workspace " + arg + " on this monitor"};
+    } catch (const std::exception&) { // stoi throws on empty / non-numeric
+        return {.success = false, .error = "gloview:setworkspace expects a workspace id"};
+    }
+    return {.success = true};
+}
 
 int luaToggle(lua_State*) {
     if (g_overview)
@@ -93,6 +116,22 @@ int luaAllWorkspaces(lua_State*) {
         g_overview->toggleAllWorkspaces();
     return 0;
 }
+int luaNext(lua_State*) {
+    if (g_overview)
+        g_overview->nextWorkspace();
+    return 0;
+}
+int luaPrev(lua_State*) {
+    if (g_overview)
+        g_overview->prevWorkspace();
+    return 0;
+}
+// hl.plugin.gloview.setworkspace(2) — returns true when the workspace was found.
+int luaSetWorkspace(lua_State* L) {
+    const bool ok = g_overview && g_overview->setWorkspace(static_cast<int>(luaL_checkinteger(L, 1)));
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
 } // namespace
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -113,6 +152,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:preview_round", Config::INTEGER{12});
     addFloat("plugin:gloview:blur", Config::FLOAT{1.0F});         // backdrop/strip blur strength 0..1 (0 = off; floats allowed)
 
+    // --- in-overview transitions ---
+    addInt("plugin:gloview:switch_animation", Config::INTEGER{1});  // slide the tiles when the displayed workspace changes
+    addInt("plugin:gloview:switch_duration", Config::INTEGER{260}); // that slide's length (ms)
+    addInt("plugin:gloview:move_animation", Config::INTEGER{1});    // fly a dropped window's preview into its new workspace card
+    addInt("plugin:gloview:move_duration", Config::INTEGER{240});   // that flight's length (ms)
+
     // --- workspace strip ---
     addStr("plugin:gloview:anchor", "");                          // top | bottom | left | right — which edge the strip attaches to (default top)
     addStr("plugin:gloview:bar_position", "top");                 // deprecated alias for anchor (top | bottom); used only if anchor is unset
@@ -130,6 +175,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:strip_active_border", Config::INTEGER{0xf0ffffffLL});
     addColor("plugin:gloview:strip_hover_border", Config::INTEGER{0x80ffffffLL});
     addColor("plugin:gloview:strip_plus_color", Config::INTEGER{0xd0eef4ffLL});
+    addColor("plugin:gloview:preview_bg", Config::INTEGER{0xff14181fLL});           // opaque backing under a preview's live surface
     addColor("plugin:gloview:shadow_color", Config::INTEGER{0x70000000LL});
     addColor("plugin:gloview:hover_border", Config::INTEGER{0xf0ffffffLL});
     addInt("plugin:gloview:hover_border_size", Config::INTEGER{3});         // hovered preview ring thickness (px)
@@ -164,6 +210,19 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // --- workspace scope / strip contents ---
     addInt("plugin:gloview:show_all_workspaces", Config::INTEGER{0}); // main area shows every window on the monitor (expo), not just the displayed workspace
     addInt("plugin:gloview:show_empty", Config::INTEGER{1});          // keep empty workspaces as strip cards
+    // gnome / hyprnome-style workspaces: only populated workspaces are listed and the strip
+    // always ends in ONE empty one (drawn as a card, not a "+"). Stepping onto it or dropping
+    // a window into it materializes it and a fresh empty tail appears; emptied workspaces drop
+    // off the strip and Hyprland reaps them. Forces show_empty off.
+    addInt("plugin:gloview:dynamic_workspaces", Config::INTEGER{1});
+    // Release the persistence pin on empty workspaces so Hyprland's normal reaping destroys
+    // them. Hyprland already reaps unpinned empties; this is for `persistent:true` ones (and
+    // gloview's own abandoned tail). Note it outlives the session's config: a persistent
+    // workspace released here does not come back until the next config reload. Set to 0 if
+    // you keep `persistent:true` workspaces you want left alone.
+    addInt("plugin:gloview:autodelete_empty", Config::INTEGER{1});
+    addInt("plugin:gloview:show_workspace_labels", Config::INTEGER{1}); // workspace names above the strip cards (off = cards grow into the freed band)
+    addInt("plugin:gloview:show_window_labels", Config::INTEGER{1});    // window title pill under a hovered/selected preview
     addInt("plugin:gloview:show_special", Config::INTEGER{0});        // include the special (scratchpad) workspace as a strip card
     addInt("plugin:gloview:strip_all_card", Config::INTEGER{0});      // show a leading "All workspaces" card on the strip that toggles the expo view
     addInt("plugin:gloview:switch_on_drop", Config::INTEGER{0});      // dropping a window on a card also follows it to that workspace
@@ -195,6 +254,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(handle, "gloview:close", dispClose);
     HyprlandAPI::addDispatcherV2(handle, "gloview:desktop", dispDesktop); // toggle the free-arrange desktop mode
     HyprlandAPI::addDispatcherV2(handle, "gloview:allworkspaces", dispAllWorkspaces); // open/toggle the all-workspaces expo view
+    // Workspace navigation inside the overview (no-ops while it is closed). Like tab and the
+    // scroll wheel these move the DISPLAYED workspace; the live desktop follows on close.
+    HyprlandAPI::addDispatcherV2(handle, "gloview:next", dispNext);
+    HyprlandAPI::addDispatcherV2(handle, "gloview:prev", dispPrev);
+    HyprlandAPI::addDispatcherV2(handle, "gloview:setworkspace", dispSetWorkspace);
 
     // hyprctl command (exact, not lua-evaluated) — reliable invoke path:  hyprctl gloview
     HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
@@ -257,6 +321,27 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     },
                                                 });
 
+    // step the displayed workspace:  hyprctl gloviewnext / gloviewprev
+    // (setworkspace takes an argument, so it is dispatcher-only: hyprctl dispatch gloview:setworkspace 2)
+    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
+                                                    .name  = "gloviewnext",
+                                                    .exact = true,
+                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+                                                        if (g_overview)
+                                                            g_overview->nextWorkspace();
+                                                        return "ok\n";
+                                                    },
+                                                });
+    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
+                                                    .name  = "gloviewprev",
+                                                    .exact = true,
+                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+                                                        if (g_overview)
+                                                            g_overview->prevWorkspace();
+                                                        return "ok\n";
+                                                    },
+                                                });
+
     const bool isLua = Config::mgr() && Config::mgr()->type() == Config::CONFIG_LUA;
     bool       luaOk = false;
     if (isLua) {
@@ -265,6 +350,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addLuaFunction(handle, "gloview", "close", luaClose);
         HyprlandAPI::addLuaFunction(handle, "gloview", "desktop", luaDesktop);
         HyprlandAPI::addLuaFunction(handle, "gloview", "allworkspaces", luaAllWorkspaces);
+        HyprlandAPI::addLuaFunction(handle, "gloview", "next", luaNext);
+        HyprlandAPI::addLuaFunction(handle, "gloview", "prev", luaPrev);
+        HyprlandAPI::addLuaFunction(handle, "gloview", "setworkspace", luaSetWorkspace);
     }
     (void)luaOk;
 

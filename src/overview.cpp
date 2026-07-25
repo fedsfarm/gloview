@@ -55,6 +55,16 @@ double easeOutCubic(double t) {
     return 1.0 - inv * inv * inv;
 }
 
+// Accelerate out, decelerate in. easeOutCubic covers 87% of the distance by the halfway
+// point, which reads as a teleport when the travel itself is the message.
+double easeInOutCubic(double t) {
+    t = std::clamp(t, 0.0, 1.0);
+    if (t < 0.5)
+        return 4.0 * t * t * t;
+    const double inv = -2.0 * t + 2.0;
+    return 1.0 - (inv * inv * inv) / 2.0;
+}
+
 // Decelerate with a gentle overshoot — tiles "pop" as they settle into their slot.
 double easeOutBack(double t) {
     t                = std::clamp(t, 0.0, 1.0);
@@ -129,6 +139,26 @@ LRect fitInside(const LRect& outer, double aspect) {
 
 bool roughly(double a, double b, double tol = 3.0) {
     return std::abs(a - b) <= tol;
+}
+
+// Overlap of two boxes; w/h are 0 when they don't touch. Used to keep a card's contents
+// inside the card: a window whose tiled slot pokes outside the monitor (floating, offscreen,
+// oversized) maps to a rel rect outside 0..1, and without an explicit crop its preview
+// spills over the strip band and the neighbouring cards.
+CBox intersectBox(const CBox& a, const CBox& b) {
+    const double x0 = std::max(a.x, b.x);
+    const double y0 = std::max(a.y, b.y);
+    const double x1 = std::min(a.x + a.w, b.x + b.w);
+    const double y1 = std::min(a.y + a.h, b.y + b.h);
+    return CBox{x0, y0, std::max(0.0, x1 - x0), std::max(0.0, y1 - y0)};
+}
+
+LRect intersectRect(const LRect& a, const LRect& b) {
+    const double x0 = std::max(a.x, b.x);
+    const double y0 = std::max(a.y, b.y);
+    const double x1 = std::min(a.x + a.w, b.x + b.w);
+    const double y1 = std::min(a.y + a.h, b.y + b.h);
+    return LRect{x0, y0, std::max(0.0, x1 - x0), std::max(0.0, y1 - y0)};
 }
 
 // Render a window's LIVE surface tree scaled into `destPx`, clipped to `clipPx`
@@ -250,11 +280,12 @@ CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
 // Immediate-mode overlay chrome split into phases so the LIVE window surfaces (queued
 // CSurfacePassElements, not immediate GL) layer between the chrome:
 // backdrop+backings (Back) → main surfaces → preview rings (MainFront) → strip chrome (Mid) →
-// strip surfaces → card rings (StripFront) → dragged tile chrome (DragBack) → dragged surface →
-// drag ring + cursor (Front). Ring phases run AFTER their surfaces (see renderRing).
+// strip surfaces → card rings (StripFront) → flying tile chrome (FlyBack) → flying surface →
+// dragged tile chrome (DragBack) → dragged surface → drag ring + cursor (Front). Ring phases
+// run AFTER their surfaces (see renderRing).
 class COverlayPass final : public IPassElement {
   public:
-    enum class Phase { Back, MainFront, Mid, StripFront, DragBack, Front };
+    enum class Phase { Back, MainFront, Mid, StripFront, FlyBack, DragBack, Front };
     COverlayPass(Overview* o, Phase phase) : m_owner(o), m_phase(phase) {}
 
     std::vector<UP<IPassElement>> draw() override {
@@ -263,11 +294,13 @@ class COverlayPass final : public IPassElement {
         switch (m_phase) {
             case Phase::Back:
                 m_owner->renderBackdrop();
+                m_owner->renderPrevPreviews(); // outgoing workspace, under the incoming one
                 m_owner->renderPreviews(); // main tile chrome; surfaces queued right after
                 break;
             case Phase::MainFront: m_owner->renderPreviewRings(); break; // over the main surfaces
             case Phase::Mid: m_owner->renderStrip(); break;              // strip chrome; surfaces queued after
             case Phase::StripFront: m_owner->renderStripRings(); break;  // over the card surfaces
+            case Phase::FlyBack: m_owner->renderFlyTile(); break;        // moved-window flight chrome; surface queued after
             case Phase::DragBack: m_owner->renderDragTile(); break;      // dragged tile chrome; surface queued after
             case Phase::Front:
                 m_owner->renderDragRing(); // over the dragged surface
@@ -323,6 +356,9 @@ Overview::~Overview() {
     m_newWs.reset();
     m_tiles.clear();
     m_strip.clear();
+    m_prevTiles.clear();
+    m_wsSliding = false;
+    m_flying.clear();
     m_snapFB.clear(); // release the snapshot framebuffers we own since 0.56
     m_snapGeom.clear();
     if (m_recaptureTimer && g_pEventLoopManager) {
@@ -455,6 +491,103 @@ Overview::Anchor Overview::stripAnchor() const {
 bool Overview::stripHorizontal() const {
     const Anchor a = stripAnchor();
     return a == Anchor::Top || a == Anchor::Bottom;
+}
+
+bool Overview::showWorkspaceLabels() const {
+    return cfgInt("plugin:gloview:show_workspace_labels", 1) != 0;
+}
+
+bool Overview::showWindowLabels() const {
+    return cfgInt("plugin:gloview:show_window_labels", 1) != 0;
+}
+
+// Band reserved above every card for its name. With workspace labels off it collapses to 0
+// so the cards grow into the freed space instead of leaving a gap where the text was.
+double Overview::stripLabelH() const {
+    return showWorkspaceLabels() ? 26.0 : 0.0;
+}
+
+// gnome / hyprnome-style workspaces: only populated workspaces are listed, and the strip
+// always ends in ONE empty workspace. Moving a window there materialises it and a fresh
+// empty tail appears; workspaces emptied this way stop being listed and Hyprland reaps them.
+bool Overview::dynamicWorkspaces() const {
+    return cfgInt("plugin:gloview:dynamic_workspaces", 1) != 0;
+}
+
+// plugin:gloview:autodelete_empty — the "empty ones automatically get deleted" half of
+// GNOME-style workspaces.
+//
+// Hyprland already destroys a plain empty workspace by itself the moment nothing holds a
+// strong ref to it (that is exactly why addWorkspace has to pin its fresh card persistent to
+// keep it alive at all). So there is nothing here to "delete": what actually lingers is
+// workspaces something still pins — a `persistent:true` rule from the user's config, or
+// gloview's own held tail. Dropping that pin lets the normal reaping take them.
+//
+// On by default, but note the one lasting effect: releasing a config-declared persistent
+// workspace is not undone until the next config reload. Set autodelete_empty = 0 to keep
+// `persistent:true` workspaces pinned.
+void Overview::autodeleteEmpty() {
+    if (cfgInt("plugin:gloview:autodelete_empty", 1) == 0)
+        return;
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
+
+    const auto shown = m_workspace.lock();
+    const auto held  = m_newWs.lock();
+
+    // Copy, not the live view: setPersistent(false) can drop the last ref and destroy the
+    // workspace mid-iteration.
+    for (const auto& ws : State::workspaceState()->workspacesCopy()) {
+        if (!ws || ws->m_isSpecialWorkspace || ws->m_id <= 0) // leave scratchpads and named (-1337…) workspaces alone
+            continue;
+        if (ws->m_monitor.lock() != m) // only this monitor's — other outputs aren't ours to prune
+            continue;
+        if (ws == shown)               // currently displayed in the overview
+            continue;
+        // Our own freshly created card. addWorkspace() pins it for exactly the reason this
+        // function undoes pins, and with switch_on_new_workspace = 0 it is created WITHOUT
+        // being displayed — so without this the sweep would delete the card the very frame it
+        // was added. Releasing it when it is genuinely abandoned is switchToWorkspace's job.
+        if (ws == held)
+            continue;
+        if (ws->isVisible())           // active on some monitor
+            continue;
+        if (workspaceOccupied(ws))
+            continue;
+        if (!ws->isPersistent())       // nothing pinning it; Hyprland reaps it without our help
+            continue;
+
+        ws->setPersistent(false);
+        dbg("autodelete: released empty workspace " + std::to_string(ws->m_id));
+    }
+}
+
+// Any window at all lives here? Deliberately broader than buildStrip's wsHasWindows(): a
+// workspace holding a window that is merely unmapped or hidden is NOT empty, and reaping it
+// out from under that window would be far worse than leaving a stale card up.
+bool Overview::workspaceOccupied(const PHLWORKSPACE& ws) const {
+    if (!ws)
+        return false;
+    for (const auto& win : Desktop::windowState()->windows())
+        if (win && win->m_workspace == ws)
+            return true;
+    return false;
+}
+
+int Overview::nextWorkspaceId() const {
+    int id = 1;
+    while (State::workspaceState()->query().id(id).run())
+        ++id;
+    return id;
+}
+
+// A create-on-use card advertises the id it will take (dynamic_workspaces labels the trailing
+// card with it), so honour that id unless something claimed it between the build and the click.
+int Overview::resolveNewId(int wanted) const {
+    if (wanted > 0 && !State::workspaceState()->query().id(wanted).run())
+        return wanted;
+    return nextWorkspaceId();
 }
 
 double Overview::stripThickness() const {
@@ -599,6 +732,9 @@ void Overview::open() {
     m_newCardAnim = false;
     m_newCardId   = 0;
     m_newWs.reset();
+    m_committedFrom.reset();
+    endWsSlide();    // nothing to slide out of on a fresh open
+    m_flying.clear();
 
     buildTiles();
     buildStrip();
@@ -632,6 +768,12 @@ void Overview::close() {
         return;
     m_opening   = false;
     m_reflowing = false;
+    endWsSlide();
+    m_flying.clear();
+
+    // Commit the displayed workspace HERE rather than in deactivate(), so Hyprland's switch
+    // is already done by the time the overlay fades — no second, delayed transition.
+    commitWorkspace();
 
     // Re-seed every tile's `natural` to the window's REAL settled geometry so the close anim
     // glides target -> real pixel-perfect (renderMainWindows assumes "progress 0 == real").
@@ -687,6 +829,10 @@ void Overview::hardClose() {
     m_progress          = 0.0;
     m_tiles.clear();
     m_strip.clear();
+    m_prevTiles.clear();
+    m_wsSliding = false;
+    m_flying.clear();
+    m_committedFrom.reset();
     m_canvasPos.clear();
     m_snapFB.clear(); // release the snapshot framebuffers we own since 0.56
     m_snapGeom.clear();
@@ -749,9 +895,11 @@ void Overview::buildTiles() {
     if (g_pHyprOpenGL && g_pHyprRenderer) {
         g_pHyprOpenGL->makeEGLCurrent();
         const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
+        // show_window_labels = 0: skip the texture entirely rather than skipping the draw, so
+        // a hidden label costs no renderText per window per rebuild.
         for (auto& t : m_tiles) {
             const auto w = t.win.lock();
-            if (!w)
+            if (!w || !showWindowLabels())
                 continue;
             std::string text = w->m_title;
             if (text.empty())
@@ -771,9 +919,17 @@ void Overview::buildStrip() {
     const auto m = m_monitor.lock();
     if (!m)
         return;
+
+    // Prune first, then list: this runs on every rebuild (open, workspace switch, reflow after
+    // a drop), so a workspace you just emptied or stepped off is gone before its card is drawn.
+    autodeleteEmpty();
+
     const auto cur = m_workspace.lock();
 
-    const bool showEmpty   = cfgInt("plugin:gloview:show_empty", 1) != 0;
+    // dynamic_workspaces implies "no stray empties": the only empty workspace on the strip is
+    // the trailing one, so show_empty is forced off regardless of how it is configured.
+    const bool dynamic     = dynamicWorkspaces();
+    const bool showEmpty   = !dynamic && cfgInt("plugin:gloview:show_empty", 1) != 0;
     const bool showSpecial = cfgInt("plugin:gloview:show_special", 0) != 0;
     const auto wsHasWindows = [](const PHLWORKSPACE& w) {
         for (const auto& win : Desktop::windowState()->windows())
@@ -833,18 +989,32 @@ void Overview::buildStrip() {
         m_strip.push_back(std::move(it));
     }
 
-    // trailing "+" card to create a new workspace
+    // Trailing card. Normally the "+" that creates a workspace on demand; under
+    // dynamic_workspaces it is drawn as an ordinary EMPTY workspace card carrying the id it
+    // will take, so the strip always ends in one blank desktop you can step onto or drop a
+    // window into (gnome / hyprnome behaviour). Either way it materialises on use.
     StripItem plus;
     plus.isPlus = true;
-    plus.id     = 0;
+    plus.isNew  = dynamic;
+    if (dynamic) {
+        // The id right after the last listed card, so the strip reads 1, 2, 3, … rather than
+        // filling whatever hole the lowest free id happens to be.
+        int tail = 1;
+        for (const auto& s : m_strip)
+            if (!s.isAll && s.id >= tail)
+                tail = s.id + 1;
+        while (State::workspaceState()->query().id(tail).run())
+            ++tail;
+        plus.id = tail;
+    }
     m_strip.push_back(std::move(plus));
 
     // render workspace name labels (cached textures) up front
-    if (g_pHyprOpenGL && g_pHyprRenderer) {
+    if (g_pHyprOpenGL && g_pHyprRenderer && showWorkspaceLabels()) {
         g_pHyprOpenGL->makeEGLCurrent();
         const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.92);
         for (auto& it : m_strip) {
-            if (it.isPlus)
+            if (it.isPlus && !it.isNew)
                 continue;
             if (it.isAll) {
                 it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, 13, false, "", 0, 600);
@@ -867,7 +1037,7 @@ void Overview::buildStrip() {
     const bool   horiz  = stripHorizontal();
     const double margin = cfgInt("plugin:gloview:strip_margin", 22);
     const double gap    = cfgInt("plugin:gloview:strip_gap", 18);
-    const double labelH = 26.0;
+    const double labelH = stripLabelH(); // 0 when workspace labels are off — cards take the space
     const double aspect = m->m_size.x / std::max(1.0, m->m_size.y);
 
     double cardW, cardH;
@@ -1190,10 +1360,153 @@ double Overview::tileProgress(int i) const {
 }
 
 LRect Overview::currentBox(const Tile& t, int i) const {
-    const double e = easeOutBack(tileProgress(i));
-    const auto&  a = t.natural;
-    const auto&  b = t.target;
-    return LRect{lerp(a.x, b.x, e), lerp(a.y, b.y, e), lerp(a.w, b.w, e), lerp(a.h, b.h, e)};
+    const double   e  = easeOutBack(tileProgress(i));
+    const auto&    a  = t.natural;
+    const auto&    b  = t.target;
+    // The workspace-switch slide rides ON TOP of the normal glide, and lives here rather than
+    // in the renderers so hit-testing, rings and keyboard nav all see the same boxes.
+    const Vector2D sl = wsSlideOffset(false);
+    return LRect{lerp(a.x, b.x, e) + sl.x, lerp(a.y, b.y, e) + sl.y, lerp(a.w, b.w, e), lerp(a.h, b.h, e)};
+}
+
+// ---- workspace-switch slide -------------------------------------------------
+
+// Freeze the tiles of the workspace we're leaving so they can slide out while the incoming
+// set slides in. Called BEFORE buildTiles() replaces m_tiles. `dir` > 0 means the new
+// workspace sits later on the strip, so it enters from the far edge.
+void Overview::beginWsSlide(int dir) {
+    // Expo shows every window regardless of the displayed workspace, so a "switch" changes
+    // nothing on screen — sliding would just duplicate every tile against itself.
+    if (cfgInt("plugin:gloview:switch_animation", 1) == 0 || showAllWorkspaces()) {
+        endWsSlide();
+        return;
+    }
+
+    std::vector<Tile> outgoing;
+    outgoing.reserve(m_tiles.size());
+    for (size_t i = 0; i < m_tiles.size(); ++i) {
+        Tile t = m_tiles[i];
+        // Store the CONTENT box (already fitted to the window's aspect) and pin
+        // natural == target: from here the tile is static and only the slide moves it.
+        // currentBox() still carries any in-flight slide offset, which is exactly where the
+        // tile is on screen — so switching again mid-slide picks up from where it looks.
+        t.natural = t.target = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
+        outgoing.push_back(std::move(t));
+    }
+
+    m_prevTiles    = std::move(outgoing);
+    m_wsSliding    = true;
+    m_wsSlideDir   = dir >= 0 ? 1 : -1;
+    m_wsSlideStart = std::chrono::steady_clock::now();
+}
+
+void Overview::endWsSlide() {
+    m_wsSliding = false;
+    m_prevTiles.clear();
+}
+
+double Overview::wsSlideRaw() const {
+    if (!m_wsSliding)
+        return 1.0;
+    const double dur = std::max(1, cfgInt("plugin:gloview:switch_duration", 260));
+    return std::clamp(nowMs(m_wsSlideStart) / dur, 0.0, 1.0);
+}
+
+// Incoming tiles start one screen out and ease to 0; the outgoing set starts at 0 and leaves
+// through the opposite edge. The axis follows the strip: a top/bottom strip lays workspaces
+// out left-to-right, a left/right strip stacks them, so the slide matches the card order.
+Vector2D Overview::wsSlideOffset(bool outgoing) const {
+    if (!m_wsSliding)
+        return Vector2D{};
+    const auto m = m_monitor.lock();
+    if (!m)
+        return Vector2D{};
+    const double e    = easeOutCubic(wsSlideRaw());
+    const double span = stripHorizontal() ? m->m_size.x : m->m_size.y;
+    const double d    = span * m_wsSlideDir * (outgoing ? -e : (1.0 - e));
+    return stripHorizontal() ? Vector2D{d, 0.0} : Vector2D{0.0, d};
+}
+
+// ---- move-to-workspace flight ------------------------------------------------
+
+// After a drop the window is already on its new workspace, so its tile would simply vanish.
+// Keep drawing it for one animation, flying from where it was released into the destination
+// card, so the move reads as a move.
+void Overview::beginFly(const PHLWINDOW& w, const LRect& from, const PHLWORKSPACE& ws, const LRect& card) {
+    m_flying.clear();
+    if (!w || !ws || cfgInt("plugin:gloview:move_animation", 1) == 0 || from.w <= 0.0 || from.h <= 0.0)
+        return;
+    // Expo keeps the window on screen after the move — it just reflows into a new slot — so a
+    // flight would draw a second copy of a tile that never left.
+    if (showAllWorkspaces())
+        return;
+    FlyWin f;
+    f.win  = w;
+    f.from = from;
+    f.to   = card;
+    f.ws   = ws;
+    m_flying.push_back(std::move(f));
+    m_flyStart = std::chrono::steady_clock::now();
+}
+
+double Overview::flyRaw() const {
+    if (m_flying.empty())
+        return 1.0;
+    const double dur = std::max(1, cfgInt("plugin:gloview:move_duration", 240));
+    return std::clamp(nowMs(m_flyStart) / dur, 0.0, 1.0);
+}
+
+// Destination: the window's OWN slot inside its new card — not the card as a whole. Aiming at
+// the card meant the preview landed centred and oversized, then popped into its real slot the
+// moment the flight ended. Re-resolved every frame, through the same box the card chrome uses,
+// so scroll / a "+" drop shifting the strip / the new card's pop-in scale all stay matched.
+LRect Overview::flyTarget(const FlyWin& f) const {
+    const auto ws = f.ws.lock();
+    if (!ws)
+        return f.to;
+    const Vector2D slide  = stripSlide(eased());
+    const Vector2D scroll = stripScroll();
+    const auto     w      = f.win.lock();
+
+    for (size_t i = 0; i < m_strip.size(); ++i) {
+        if (m_strip[i].ws.lock() != ws)
+            continue;
+        const LRect card = stripCardBox(i, slide, scroll);
+        for (const auto& sw : m_strip[i].wins) {
+            if (sw.win.lock() != w)
+                continue;
+            return LRect{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h)};
+        }
+        // card is there but the window hasn't been tiled into it yet — aim at the card
+        return fitInside(card, f.from.h > 0.0 ? f.from.w / f.from.h : 1.0);
+    }
+    return f.to;
+}
+
+LRect Overview::flyBox(const FlyWin& f) const {
+    const double e  = easeInOutCubic(flyRaw());
+    const LRect  to = flyTarget(f);
+    return LRect{lerp(f.from.x, to.x, e), lerp(f.from.y, to.y, e), lerp(f.from.w, to.w, e), lerp(f.from.h, to.h, e)};
+}
+
+// Corner radius along the way: a preview's radius on a slot the size of a card's window is
+// enormous, so ease it towards the strip's own radius and clamp it to the shrinking box —
+// landing on exactly what renderStripWindows will draw a frame later.
+double Overview::flyRound(const LRect& box) const {
+    const double e = easeInOutCubic(flyRaw());
+    const double r = lerp(cfgInt("plugin:gloview:preview_round", 12), cfgInt("plugin:gloview:strip_card_round", 10), e);
+    return std::min(r, std::min(box.w, box.h) * 0.35);
+}
+
+// True while this window's flight is still in the air. Its destination card must not draw it
+// yet: the card preview appearing at once turned the flight into a copy landing on top of an
+// original that was already sitting there. Suppressed, the flight IS the window arriving, and
+// the card takes over on the frame it ends.
+bool Overview::isFlying(const PHLWINDOW& w) const {
+    for (const auto& f : m_flying)
+        if (f.win.lock() == w)
+            return true;
+    return false;
 }
 
 void Overview::updateAnimation() {
@@ -1202,6 +1515,10 @@ void Overview::updateAnimation() {
     m_progress       = m_opening ? t : 1.0 - t;
     if (m_reflowing && nowMs(m_reflowStart) >= dur)
         m_reflowing = false;
+    if (m_wsSliding && wsSlideRaw() >= 1.0)
+        endWsSlide();
+    if (!m_flying.empty() && flyRaw() >= 1.0)
+        m_flying.clear();
     if (m_newCardAnim && nowMs(m_newCardStart) >= std::max(120, cfgInt("plugin:gloview:duration", 360))) {
         m_newCardAnim = false;
         m_newCardId   = 0;
@@ -1250,15 +1567,22 @@ void Overview::renderStage(eRenderStage stage) {
     }
 
     // Layer order: backdrop + main tile chrome → main surfaces → strip chrome → strip
-    // surfaces → drag chrome → drag surface → cursor. The immediate-mode chrome is split
-    // across COverlayPass phases so the queued surfaces slot between them.
+    // surfaces → flying-tile chrome + surface → drag chrome → drag surface → cursor. The
+    // immediate-mode chrome is split across COverlayPass phases so the queued surfaces slot
+    // between them.
     auto& pass = g_pHyprRenderer->m_renderPass;
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Back));
+    renderPrevWindows(); // outgoing workspace's surfaces, under the incoming set
     renderMainWindows();
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::MainFront));
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Mid));
     renderStripWindows();
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::StripFront));
+    // a window flying into its new workspace card passes OVER the strip, so it lands on top
+    if (!m_flying.empty()) {
+        pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::FlyBack));
+        renderFlyWindow();
+    }
     const bool dragging = m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size());
     if (dragging) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
@@ -1333,7 +1657,7 @@ void Overview::renderStrip() const {
 
         g_pHyprOpenGL->renderRect(pxb(c, s), actLike ? activeBg : cardBg, {.round = pxr(cardRound, s)});
 
-        if (it.isPlus) {
+        if (it.isPlus && !it.isNew) {
             // draw a centered plus
             const double t  = std::max(2.0, card.h * 0.04);
             const double L  = std::min(card.w, card.h) * 0.34;
@@ -1358,16 +1682,27 @@ void Overview::renderStrip() const {
                 const auto w = sw.win.lock();
                 if (!w || !w->m_isMapped || w->isHidden())
                     continue;
+                if (isFlying(w))
+                    continue; // still arriving; renderFlyTile is drawing it
                 // inset 1px so the backing stays under the live surface and can't peek as a
-                // thin dark edge line (see drawPreviewTile).
-                const CBox wb(card.x + sw.rel.x * card.w + 1.0, card.y + sw.rel.y * card.h + 1.0,
-                              std::max(2.0, sw.rel.w * card.w - 2.0), std::max(2.0, sw.rel.h * card.h - 2.0));
-                g_pHyprOpenGL->renderRect(pxb(wb, s), argb(0xff14181f, e), {.round = pxr(4, s)});
+                // thin dark edge line (see drawPreviewTile), then CROP to the card. A window
+                // whose tiled slot falls partly outside the monitor (floating/offscreen/
+                // oversized) has a rel rect outside 0..1, and an uncropped backing paints
+                // over the band and its neighbours.
+                const LRect wb{card.x + sw.rel.x * card.w + 1.0, card.y + sw.rel.y * card.h + 1.0,
+                               std::max(2.0, sw.rel.w * card.w - 2.0), std::max(2.0, sw.rel.h * card.h - 2.0)};
+                const LRect vis = intersectRect(wb, card);
+                if (vis.w <= 0.0 || vis.h <= 0.0)
+                    continue;
+                // a cropped edge must stay square — rounding it would leave the corner arc
+                // floating in the middle of the card, where nothing covers it.
+                const bool cropped = !roughly(vis.w, wb.w, 0.01) || !roughly(vis.h, wb.h, 0.01);
+                g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = cropped ? 0 : pxr(4, s)});
             }
         }
 
         // workspace label, centered above the card
-        if (it.label && it.label->m_size.x > 0) {
+        if (showWorkspaceLabels() && it.label && it.label->m_size.x > 0) {
             double       lw    = it.label->m_size.x;
             double       lh    = it.label->m_size.y;
             const double maxLw = card.w + 24.0;
@@ -1376,8 +1711,8 @@ void Overview::renderStrip() const {
                 lw *= s;
                 lh *= s;
             }
-            // labelH (26) is reserved above every card by buildStrip (both layouts).
-            const double labelBand = 26.0;
+            // the same band buildStrip reserved above every card (both layouts).
+            const double labelBand = stripLabelH();
             const double lx        = card.cx() - lw / 2.0;
             const double ly        = card.y - labelBand + (labelBand - lh) / 2.0;
             const float  la        = it.active ? static_cast<float>(e) : static_cast<float>(e) * 0.75F;
@@ -1411,6 +1746,8 @@ void Overview::renderStripWindows() const {
             const auto w = sw.win.lock();
             if (!w || !w->m_isMapped || w->isHidden())
                 continue;
+            if (isFlying(w))
+                continue; // still arriving; renderFlyWindow is drawing it
             // window slot inside the card, from its tiled goal position (logical)
             const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w),
                              std::max(2.0, sw.rel.h * card.h)};
@@ -1418,10 +1755,19 @@ void Overview::renderStripWindows() const {
             // pre-scaled to pixels too (pxb), so surface and backing coincide at any monitor scale.
             const CBox slotPx(slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale);
             const CBox cardPx(card.x * scale, card.y * scale, card.w * scale, card.h * scale);
-            // Add clipping to the previews in the strip
-            const double stripRound = std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
-                                               std::min(slot.w, slot.h) * 0.35);
-            renderWindowLive(w, m, slotPx, slotPx, static_cast<float>(e), when, stripRound);
+            // CROP to the card, not just to the window's own slot: a window whose tiled slot
+            // pokes outside the monitor maps to a rel rect outside 0..1, and clipping to the
+            // slot alone let the preview spill over the band and the neighbouring cards.
+            const CBox clipPx = intersectBox(slotPx, cardPx);
+            if (clipPx.w <= 0.0 || clipPx.h <= 0.0)
+                continue; // entirely outside the card
+            // Round the surface only while it is fully inside the card — on a cropped edge the
+            // corner arc would sit mid-card with nothing behind it.
+            const bool   cropped    = !roughly(clipPx.w, slotPx.w, 0.01) || !roughly(clipPx.h, slotPx.h, 0.01);
+            const double stripRound = cropped ? 0.0 :
+                                                std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
+                                                         std::min(slot.w, slot.h) * 0.35);
+            renderWindowLive(w, m, slotPx, clipPx, static_cast<float>(e), when, stripRound);
         }
     }
 }
@@ -1648,6 +1994,96 @@ void Overview::renderMainWindows() const {
         const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
         const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
         renderWindowLive(w, m, px, px, 1.0F, when, static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
+    }
+}
+
+// Chrome for the outgoing workspace's tiles during a switch slide: shadow + opaque backing
+// only. No labels, rings or close buttons — the set is leaving and takes no input.
+void Overview::renderPrevPreviews() const {
+    const auto m = m_monitor.lock();
+    if (!m || m_prevTiles.empty())
+        return;
+    const double   s         = m->m_scale;
+    const double   e         = eased();
+    const int      round     = cfgInt("plugin:gloview:preview_round", 12);
+    const auto     shadowCol = argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0);
+    const auto     bg        = argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), 1.0);
+    const Vector2D off       = wsSlideOffset(true);
+
+    for (const auto& t : m_prevTiles) {
+        const auto w = t.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const LRect lb{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h};
+        g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + 6.0, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(16.0 * s), shadowCol, e * 0.9);
+        // same 1px inset as drawPreviewTile: keeps the backing under the over-covered surface
+        const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
+        g_pHyprOpenGL->renderRect(pxb(bb, s), bg, {.round = pxr(round, s)});
+    }
+}
+
+void Overview::renderPrevWindows() const {
+    const auto m = m_monitor.lock();
+    if (!m || m_prevTiles.empty())
+        return;
+    const double   scale = m->m_scale;
+    const auto     when  = Time::steadyNow();
+    const Vector2D off   = wsSlideOffset(true);
+    const double   round = cfgInt("plugin:gloview:preview_round", 12);
+
+    for (const auto& t : m_prevTiles) {
+        const auto w = t.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const CBox px((t.target.x + off.x) * scale, (t.target.y + off.y) * scale, t.target.w * scale, t.target.h * scale);
+        renderWindowLive(w, m, px, px, 1.0F, when, round);
+    }
+}
+
+// Chrome for a window flying into the workspace card it was just dropped on. Fades out as it
+// lands, by which point the card's own preview has taken over.
+void Overview::renderFlyTile() const {
+    const auto m = m_monitor.lock();
+    if (!m || m_flying.empty())
+        return;
+    const double s         = m->m_scale;
+    // No fade: the tile stays solid the whole way and simply BECOMES the card's preview. It
+    // used to fade out as it flew, which — on top of the card already showing the window —
+    // read as the drop failing rather than completing.
+    const double lift      = 1.0 - easeInOutCubic(flyRaw()); // 1 in the air, 0 on the card
+    const auto   shadowCol = argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0);
+    const auto   bg        = argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), 1.0);
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const LRect  lb    = flyBox(f);
+        const double round = flyRound(lb);
+        // Shadow tracks the shrinking box and settles out entirely — cards cast none, so a
+        // full-size drop shadow on a card-sized tile is what made the landing look pasted on.
+        const double range = std::clamp(std::min(lb.w, lb.h) * 0.14, 3.0, 26.0) * lift;
+        if (range >= 1.0)
+            g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + range * 0.45, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(range * s), shadowCol, lift * 0.9);
+        const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
+        g_pHyprOpenGL->renderRect(pxb(bb, s), bg, {.round = pxr(round, s)});
+    }
+}
+
+void Overview::renderFlyWindow() const {
+    const auto m = m_monitor.lock();
+    if (!m || m_flying.empty())
+        return;
+    const double scale = m->m_scale;
+    const auto   when  = Time::steadyNow();
+
+    for (const auto& f : m_flying) {
+        const auto w = f.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const LRect lb = flyBox(f);
+        const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
+        renderWindowLive(w, m, px, px, 1.0F, when, flyRound(lb)); // opaque all the way — see renderFlyTile
     }
 }
 
@@ -1930,7 +2366,7 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
                 if (m_strip[i].isAll)
                     toggleAllWorkspaces();
                 else if (m_strip[i].isPlus)
-                    addWorkspace();
+                    addWorkspace(m_strip[i].id); // 0 for the plain "+"; the advertised id for the dynamic tail
                 else
                     switchToWorkspace(m_strip[i]);
                 return true;
@@ -1959,7 +2395,10 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
         return true; // middle was fully handled on press
     }
     const int press = m_pressTile;
-    m_pressTile     = PRESS_NONE;
+    // The dragged tile's on-screen box, captured while m_pressTile/m_dragging are still set —
+    // dragBox() reads both, and a drop onto a card starts its flight from exactly here.
+    const LRect draggedBox = (m_dragging && press >= 0 && press < static_cast<int>(m_tiles.size())) ? tileContentBox(static_cast<size_t>(press), dragBox()) : LRect{};
+    m_pressTile            = PRESS_NONE;
 
     if (press == PRESS_STRIP || press == PRESS_CONSUMED)
         return true; // switch / ✕ already handled on press; ignore the release
@@ -1972,7 +2411,7 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             for (size_t i = 0; i < m_strip.size(); ++i) {
                 const LRect c = stripCardAt(i);
                 if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
-                    dropOnWorkspace(w, m_strip[i]);
+                    dropOnWorkspace(w, m_strip[i], draggedBox);
                     return true;
                 }
             }
@@ -2016,18 +2455,20 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     return true;
 }
 
-void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
+void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox) {
     const auto m = m_monitor.lock();
     if (!w || !m) {
         damage();
         return;
     }
 
+    // the card's on-screen box, for the flight's destination (re-resolved per frame after this)
+    const Vector2D sc = stripScroll();
+    const LRect    cardBox{it.card.x + sc.x, it.card.y + sc.y, it.card.w, it.card.h};
+
     PHLWORKSPACE target;
-    if (it.isPlus) {
-        int id = 1;
-        while (State::workspaceState()->query().id(id).run())
-            ++id;
+    if (it.isPlus) { // the "+" card, or dynamic_workspaces' trailing empty one
+        const int id   = resolveNewId(it.id);
         target         = State::workspaceState()->create(id, m->m_id);
         m_newCardId    = id; // pop the new card in
         m_newCardStart = std::chrono::steady_clock::now();
@@ -2040,6 +2481,13 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
         return;
     }
 
+    // switch_on_drop follows the window to its new workspace, so it reappears as a full-size
+    // main-area tile — flying a second copy of it into the card at the same time reads as two
+    // windows. Only animate the move when the window is actually leaving the view.
+    const bool follow = cfgInt("plugin:gloview:switch_on_drop", 0) != 0;
+    if (!follow)
+        beginFly(w, fromBox, target, cardBox);
+
     std::vector<std::pair<PHLWINDOW, LRect>> oldBoxes;
     oldBoxes.reserve(m_tiles.size());
     for (size_t i = 0; i < m_tiles.size(); ++i) {
@@ -2051,7 +2499,7 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
     Desktop::globalWindowController()->moveWindowToWorkspace(w, target);
 
     // switch_on_drop: follow the window to its new workspace instead of staying put.
-    if (cfgInt("plugin:gloview:switch_on_drop", 0) != 0) {
+    if (follow) {
         StripItem dst;
         dst.ws = target;
         switchToWorkspace(dst);
@@ -2116,24 +2564,46 @@ void Overview::switchToWorkspace(const StripItem& it) {
     if (!m)
         return;
 
+    const auto cur = m_workspace.lock();
+
     PHLWORKSPACE ws;
     if (it.isPlus) {
-        int id = 1;
-        while (State::workspaceState()->query().id(id).run())
-            ++id;
-        ws = State::workspaceState()->create(id, m->m_id, "", false);
+        ws = State::workspaceState()->create(resolveNewId(it.id), m->m_id, "", false);
         if (!ws)
             return;
+        // A brand-new empty workspace is reaped within a frame or two unless it is focused,
+        // and we only display it (the live switch lands on close) — hold it so its card and
+        // its tiles survive. deactivate() releases the hold; the previous held one is let go
+        // here, which is what makes dynamic_workspaces' abandoned empties disappear again.
+        if (const auto old = m_newWs.lock(); old && old != ws)
+            old->setPersistent(false);
+        ws->setPersistent(true);
+        m_newWs = ws;
     } else if (const auto target = it.ws.lock()) {
         ws = target;
-        if (ws == m_workspace.lock())
+        if (ws == cur)
             return; // already showing it
     } else
         return;
 
+    // Slide direction from strip order — the cards are sorted by id, so the ids decide it.
+    // A freshly created workspace always takes the highest id, hence "forward".
+    beginWsSlide((!cur || ws->m_id >= cur->m_id) ? 1 : -1);
+
     // Display the target inside the overview without changing the live desktop yet;
     // captureSnapshots() force-renders inactive workspaces without a real slide.
     m_workspace = ws;
+
+    // Stepping OFF a tail workspace we created and never put anything on: drop the hold so it
+    // reaps, rather than leaving a pinned empty around for the rest of the session. Only under
+    // dynamic_workspaces, where the tail is ephemeral by design — with the plain "+" card the
+    // user asked for that workspace, so it stays until close.
+    if (dynamicWorkspaces()) {
+        if (const auto held = m_newWs.lock(); held && held != ws && !workspaceOccupied(held)) {
+            held->setPersistent(false);
+            m_newWs.reset();
+        }
+    }
 
     // Rebuild around the displayed workspace and keep the overview visually
     // settled; clicking strip cards should not replay the opening animation.
@@ -2146,6 +2616,76 @@ void Overview::switchToWorkspace(const StripItem& it) {
     m_reflowing = false;
     m_animStart = std::chrono::steady_clock::now() - std::chrono::milliseconds(std::max(1, cfgInt("plugin:gloview:duration", 360)));
     damage();
+}
+
+// Push the displayed workspace onto the live desktop. Run at the START of the close
+// animation: committing it in deactivate() (i.e. at the END) meant Hyprland only began its
+// own workspace-change transition once our overlay had already faded out, so a switch made
+// in the overview visibly replayed a beat late. Hyprland's transition is warped to its end
+// here as well, so it can neither play under the fade nor after it.
+void Overview::commitWorkspace() {
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
+    const auto ws = m_workspace.lock();
+    if (!ws || ws == m->m_activeWorkspace)
+        return;
+
+    const auto prev = m->m_activeWorkspace;
+    m->changeWorkspace(ws, false, true, false);
+    m_committedFrom = prev; // keep it hidden behind the fade (see the member's comment)
+
+    // Warp value AND re-aim at the goal, never assign the goal — see captureSnapshots() for
+    // why writing a workspace's animation goal directly corrupts it for every later open.
+    const auto settle = [](const PHLWORKSPACE& w) {
+        if (!w)
+            return;
+        if (w->m_renderOffset)
+            w->m_renderOffset->setValueAndWarp(w->m_renderOffset->goal());
+        if (w->m_alpha)
+            w->m_alpha->setValueAndWarp(w->m_alpha->goal());
+    };
+    settle(prev);
+    settle(ws);
+}
+
+// gloview:next / gloview:prev — same semantics as tab and the scroll wheel: move the
+// DISPLAYED workspace, commit to the live desktop on close. No-op while closed.
+void Overview::nextWorkspace() {
+    if (m_active && m_opening)
+        stepWorkspace(1);
+}
+
+void Overview::prevWorkspace() {
+    if (m_active && m_opening)
+        stepWorkspace(-1);
+}
+
+// gloview:setworkspace <id>. Prefers the strip card, but falls back to any workspace living
+// on this monitor so the dispatcher isn't at the mercy of show_empty / dynamic_workspaces
+// hiding the target's card.
+bool Overview::setWorkspace(int id) {
+    if (!(m_active && m_opening))
+        return false;
+    for (const auto& it : m_strip) {
+        if (it.isAll || (it.isPlus && !it.isNew))
+            continue;
+        if (it.id == id) {
+            switchToWorkspace(it); // NOTE: rebuilds m_strip — `it` must not be touched after
+            return true;
+        }
+    }
+    const auto m = m_monitor.lock();
+    if (!m)
+        return false;
+    const auto ws = State::workspaceState()->query().id(id).run();
+    if (!ws || ws->m_monitor.lock() != m)
+        return false;
+    StripItem it;
+    it.ws = ws;
+    it.id = id;
+    switchToWorkspace(it);
+    return true;
 }
 
 namespace {
@@ -2218,7 +2758,7 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
         // this self-switch as external.
         int n = 0;
         for (const auto& it : m_strip) {
-            if (it.isPlus || it.isAll) // count only real workspace cards
+            if ((it.isPlus && !it.isNew) || it.isAll) // count only real workspace cards
                 continue;
             if (n++ == ws) {
                 switchToWorkspace(it);
@@ -2434,6 +2974,18 @@ void Overview::syncFocus() const {
 // without re-running the chrome reveal (m_progress pinned at 1). Shared by
 // drop-to-workspace and close-window.
 void Overview::replayReflow(std::vector<std::pair<PHLWINDOW, LRect>>& oldBoxes) {
+    // A workspace slide in flight has its offset baked into every box the caller captured
+    // (currentBox adds it). The reflow cancels the slide, so take the offset back out —
+    // otherwise every tile would start its glide a full screen off to one side.
+    if (m_wsSliding) {
+        const Vector2D off = wsSlideOffset(false);
+        for (auto& [oldWin, oldBox] : oldBoxes) {
+            oldBox.x -= off.x;
+            oldBox.y -= off.y;
+        }
+        endWsSlide();
+    }
+
     m_hovered = m_hoveredStrip = -1;
     buildTiles();
     buildStrip();
@@ -2475,7 +3027,9 @@ void Overview::closeTileWindow(int i) {
 // Drop any tile whose window has gone away (closed by us or by itself), then glide
 // the survivors into their re-laid-out slots. No-op while capturing/closing.
 void Overview::syncTiles() {
-    if (!m_active || !m_opening || m_capturing || m_pendingDeactivate || m_reflowing)
+    // m_wsSliding too: the tile set is mid-swap during a workspace slide, and a reflow here
+    // would cancel the slide and snap everything into place.
+    if (!m_active || !m_opening || m_capturing || m_pendingDeactivate || m_reflowing || m_wsSliding)
         return;
     const auto ws = m_workspace.lock();
     if (!ws)
@@ -2528,10 +3082,12 @@ void Overview::stepWorkspace(int dir) {
         return;
     // collect only the real workspace cards (skip the "+" and the optional "All" card),
     // then step within that list so the wrap can't land on a non-workspace card.
+    // dynamic_workspaces' trailing empty card DOES count: stepping onto it is how you reach
+    // (and thereby create) the next desktop, gnome-style.
     std::vector<int> real;
     int              activePos = -1;
     for (size_t i = 0; i < m_strip.size(); ++i) {
-        if (m_strip[i].isPlus || m_strip[i].isAll)
+        if ((m_strip[i].isPlus && !m_strip[i].isNew) || m_strip[i].isAll)
             continue;
         if (m_strip[i].active)
             activePos = static_cast<int>(real.size());
@@ -2601,19 +3157,20 @@ void Overview::restoreFill() {
 
 // "+" card: create the lowest-free-id workspace, pop its card in, and (per
 // switch_on_new_workspace) optionally follow the display to it.
-void Overview::addWorkspace() {
+void Overview::addWorkspace(int id_) {
     const auto m = m_monitor.lock();
     if (!m)
         return;
-    int id = 1;
-    while (State::workspaceState()->query().id(id).run())
-        ++id;
+    const int  id = resolveNewId(id_);
     const auto ws = State::workspaceState()->create(id, m->m_id, "", false);
     if (!ws)
         return;
     // A new empty workspace is reaped within a frame or two unless focused. Hold it
     // persistent so its card survives while up; deactivate() releases it (normal reaping
-    // applies after).
+    // applies after). Releasing the previously held one is what lets an abandoned empty
+    // workspace disappear again under dynamic_workspaces.
+    if (const auto old = m_newWs.lock(); old && old != ws)
+        old->setPersistent(false);
     ws->setPersistent(true);
     m_newWs        = ws;
     m_newCardId    = id;
@@ -2679,6 +3236,9 @@ bool Overview::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& mon) const
     // doesn't bleed the current one through the translucent backdrop.
     if (const auto aw = m->m_activeWorkspace; aw && w->m_workspace == aw)
         return true;
+    // …and the workspace close() committed away from, which the rule above no longer covers.
+    if (const auto from = m_committedFrom.lock(); from && w->m_workspace == from)
+        return true;
     return false;
 }
 
@@ -2709,6 +3269,9 @@ void Overview::deactivate() {
     m_progress = 0.0;
     m_tiles.clear();
     m_strip.clear();
+    m_committedFrom.reset();
+    endWsSlide();
+    m_flying.clear();
     m_hovered = m_hoveredStrip = -1;
     m_selected = -1;
     m_recaptureLeft = 0;

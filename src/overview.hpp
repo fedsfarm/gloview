@@ -72,6 +72,13 @@ class Overview {
     void toggleDesktop(); // open (or, if already open, switch into) free-arrange desktop mode
     void toggleAllWorkspaces(); // open (or, if already open, toggle) the all-workspaces "expo" main view
 
+    // Workspace navigation, exposed as dispatchers / lua (gloview:next, gloview:prev,
+    // gloview:setworkspace). Like tab / the scroll wheel these move the DISPLAYED
+    // workspace only; the live desktop follows when the overview closes. No-op closed.
+    void nextWorkspace();
+    void prevWorkspace();
+    bool setWorkspace(int id); // false if no such workspace on this monitor
+
     // wired to Hyprland's event bus / render pass
     void renderStage(eRenderStage stage);
     void renderBackdrop() const;
@@ -81,6 +88,10 @@ class Overview {
     void renderPreviews() const;  // static tiles' chrome (shadow/backing/title), drawn under the strip
     void renderMainWindows() const; // live window surfaces for the main-area tiles
     void renderPreviewRings() const; // tile hover/selection rings, over the main surfaces
+    void renderPrevPreviews() const;  // outgoing workspace's tile chrome during a switch slide
+    void renderPrevWindows() const;   // outgoing workspace's live surfaces during a switch slide
+    void renderFlyTile() const;   // the "moved to workspace" tile's chrome, drawn over the strip
+    void renderFlyWindow() const; // the "moved to workspace" tile's live surface
     void renderDragTile() const;  // the picked-up tile's chrome, drawn over the strip
     void renderDragWindow() const; // the picked-up tile's live surface
     void renderDragRing() const;  // the picked-up tile's ring, over its surface
@@ -125,6 +136,10 @@ class Overview {
         bool                  active = false;
         bool                  isPlus = false;
         bool                  isAll  = false; // the leading "All workspaces" card (toggles the expo view)
+        // dynamic_workspaces: the trailing card is a real-looking EMPTY workspace instead of
+        // a "+" glyph. It still carries isPlus (create-on-use), but it is drawn like a normal
+        // card, is labelled with the id it will take, and participates in next/prev stepping.
+        bool                  isNew  = false;
         LRect                 card; // monitor-local logical
         std::vector<StripWin> wins;
         SP<Render::ITexture>  label; // cached rendered workspace name
@@ -155,8 +170,34 @@ class Overview {
     PHLMONITORREF                         m_monitor;
     PHLWORKSPACEREF                       m_workspace;    // workspace shown in the main area
     PHLWORKSPACEREF                       m_liveWsAtOpen; // monitor's live active workspace when opened (exit_on_switch)
+    // Workspace commitWorkspace() switched AWAY from. It is no longer the active one, so
+    // shouldHideWindow's active-workspace rule stops covering it, and its own fade-out was
+    // warped away — without an explicit hide it can bleed through the backdrop for the rest
+    // of the close animation.
+    PHLWORKSPACEREF                       m_committedFrom;
     std::vector<Tile>                     m_tiles;
     std::vector<StripItem>                m_strip;
+
+    // Workspace-switch slide: the outgoing workspace's tiles are kept (frozen at the boxes
+    // they occupied) and slid off one edge while the incoming set slides in from the other.
+    // Purely visual — m_prevTiles never takes hover/selection/drag and is dropped when the
+    // slide ends. Empty vector == no slide in flight.
+    std::vector<Tile>                     m_prevTiles;
+    bool                                  m_wsSliding  = false;
+    int                                   m_wsSlideDir = 1; // +1 = incoming enters from the far edge (higher workspace)
+    std::chrono::steady_clock::time_point m_wsSlideStart;
+
+    // "moved to workspace" flight: after a drop, the window's preview keeps flying from the
+    // drop point into its destination card and fades there, so the move reads as a move
+    // instead of the tile blinking out. The real window is already on the target workspace.
+    struct FlyWin {
+        PHLWINDOWREF    win;
+        LRect           from; // monitor-local box at the drop
+        LRect           to;   // fallback destination (the card box at drop time)
+        PHLWORKSPACEREF ws;   // destination, so the box tracks the card across strip rebuilds
+    };
+    std::vector<FlyWin>                   m_flying;
+    std::chrono::steady_clock::time_point m_flyStart;
     // window* -> monitor-local logical rect its persistent snapshot FB content sits in,
     // recorded only when the window was SETTLED (value≈goal, client buffer matches its
     // box) at capture. Lets a window retiled on a hidden workspace (frozen value!=goal,
@@ -233,6 +274,14 @@ class Overview {
     Vector2D stripSlide(double e) const; // reveal slide-in offset at progress e
     Vector2D stripScroll() const;        // current scroll offset of the card group
     LRect    stripCardAt(size_t i) const;// m_strip[i].card shifted by the current scroll (for hit-testing)
+    bool   showWorkspaceLabels() const; // plugin:gloview:show_workspace_labels
+    bool   showWindowLabels() const;    // plugin:gloview:show_window_labels
+    double stripLabelH() const;         // band reserved above each card for its name (0 when labels are off)
+    bool   dynamicWorkspaces() const;   // plugin:gloview:dynamic_workspaces (gnome/hyprnome-style empty-tail workspaces)
+    void   autodeleteEmpty();           // plugin:gloview:autodelete_empty — let Hyprland reap empty workspaces this monitor still pins
+    bool   workspaceOccupied(const PHLWORKSPACE& ws) const; // any window at all on it (mapped or not)
+    int    nextWorkspaceId() const;     // lowest free workspace id (>= 1)
+    int    resolveNewId(int wanted) const; // the id a create-on-use card advertised, unless it got taken meanwhile
     bool   showAllWorkspaces() const; // effective expo state: runtime override (m_allOverride) else plugin:gloview:show_all_workspaces
     bool   tileBelongs(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWORKSPACE& ws) const; // shared main-area membership test (buildTiles + syncTiles MUST agree)
     void   buildTiles();
@@ -245,16 +294,31 @@ class Overview {
     double eased() const;                       // opacity / backdrop progress
     double tileBaseProgress() const;            // 0..1 driver for tile glide (reflow timer or m_progress)
     double tileProgress(int i) const;           // staggered raw progress for tile i
-    LRect  currentBox(const Tile& t, int i) const; // lerped natural->target, staggered + overshoot
+    LRect  currentBox(const Tile& t, int i) const; // lerped natural->target, staggered + overshoot (incl. the switch slide)
+
+    // workspace-switch slide
+    void     beginWsSlide(int dir);         // freeze the current tiles as the outgoing set and start the slide
+    void     endWsSlide();                  // drop the outgoing set
+    double   wsSlideRaw() const;            // 0..1 linear
+    Vector2D wsSlideOffset(bool outgoing) const; // px shift for the incoming / outgoing tile set
+
+    // move-to-workspace flight
+    void   beginFly(const PHLWINDOW& w, const LRect& from, const PHLWORKSPACE& ws, const LRect& card);
+    double flyRaw() const;   // 0..1 linear
+    LRect  flyBox(const FlyWin& f) const; // current box, lerped from -> to
+    LRect  flyTarget(const FlyWin& f) const; // the window's slot in its destination card (re-resolved each frame)
+    double flyRound(const LRect& box) const; // corner radius on the way in: preview_round -> strip_card_round
+    bool   isFlying(const PHLWINDOW& w) const; // destination card must not draw a window still in flight
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
     void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/backing/title)
     void   drawPreviewRing(size_t i, const LRect& slot, bool lift) const; // hover/selection ring, over the live surface
     LRect  stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const; // card box incl. scroll + pop-in
     void   switchToWorkspace(const StripItem& it);
-    void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it);
+    void   commitWorkspace();                 // push the displayed workspace to the live desktop, warping Hyprland's own slide away
+    void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
-    void   addWorkspace();                    // "+" card: create a workspace (animate it in, optionally follow)
+    void   addWorkspace(int id = 0);          // "+" / trailing empty card: create a workspace (animate it in, optionally follow); 0 = lowest free id
     void   closeWorkspaceWindows(const StripItem& it); // middle-click a card: send-close every window on it
     void   setDesktopMode(bool on);           // flip grid<->canvas while open, gliding the previews (purely visual; never mutates a real window)
     LRect  closeButtonRect(const LRect& tile) const;   // desktop-mode "✕" hit/draw rect for a tile content box

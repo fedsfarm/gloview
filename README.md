@@ -51,18 +51,31 @@ Dispatchers: `gloview:toggle`, `gloview:open`, `gloview:close`, `gloview:desktop
 `gloview:allworkspaces` (the all-workspaces "expo" view — opens into it if closed)
 Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`
 
+Workspace navigation: `gloview:next`, `gloview:prev`, `gloview:setworkspace <id>`
+(or `hyprctl gloviewnext` / `gloviewprev`). Like `tab` and the scroll wheel these
+move the *displayed* workspace and commit it to the live desktop when the overview
+closes; they do nothing while it is closed.
+
 Lua:
 
 ```lua
 hl.bind("SUPER + TAB", hl.plugin.gloview.toggle)
 hl.bind("SUPER + SHIFT + TAB", hl.plugin.gloview.desktop)
 hl.bind("SUPER + CTRL + TAB", hl.plugin.gloview.allworkspaces)
+
+hl.bind("SUPER + bracketright", hl.plugin.gloview.next)
+hl.bind("SUPER + bracketleft", hl.plugin.gloview.prev)
+hl.bind("SUPER + 2", function() hl.plugin.gloview.setworkspace(2) end)
 ```
 
 ```ini
 bind = SUPER, TAB, gloview:toggle
 bind = SUPER SHIFT, TAB, gloview:desktop
 bind = SUPER CTRL, TAB, gloview:allworkspaces
+
+bind = SUPER, bracketright, gloview:next
+bind = SUPER, bracketleft, gloview:prev
+bind = SUPER, 2, gloview:setworkspace, 2
 ```
 
 ## Config
@@ -84,6 +97,10 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `duration` | int (ms) | `360` | Open/close animation length |
 | `preview_round` | int (px) | `12` | Window preview corner radius |
 | `blur` | float `0`..`1` | `1.0` | Backdrop + strip blur strength (`0` = off; fractions allowed) |
+| `switch_animation` | bool (0/1) | `1` | Slide the previews sideways when the displayed workspace changes (the outgoing set leaves as the incoming one arrives) |
+| `switch_duration` | int (ms) | `260` | Length of that slide |
+| `move_animation` | bool (0/1) | `1` | A window dropped on a workspace card keeps flying into it, shrinking into its slot; the card holds off drawing it until it lands |
+| `move_duration` | int (ms) | `240` | Length of that flight |
 | `anchor` | `top` \| `bottom` \| `left` \| `right` | `top` | Edge the workspace strip attaches to |
 | `strip_offset` | int (px) | `0` | Inset from the anchored edge (0 = flush, no gap) |
 | `strip_height` | int (px) | `150` | Strip band thickness, label included |
@@ -99,6 +116,7 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `strip_hover_border` | color | `0x80ffffff` | Hovered card border |
 | `strip_hover_border_size` | int (px) | `2` | Hovered card border thickness |
 | `strip_plus_color` | color | `0xd0eef4ff` | The "+" glyph |
+| `preview_bg` | color | `0xff14181f` | Opaque backing drawn under a preview's live surface |
 | `shadow_color` | color | `0x70000000` | Window preview drop shadow |
 | `hover_border` | color | `0xf0ffffff` | Hovered window preview border |
 | `hover_border_size` | int (px) | `3` | Hovered preview border thickness |
@@ -119,7 +137,11 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `exit_on_click` | bool (0/1) | `1` | Click on empty space dismisses the overview |
 | `exit_on_switch` | bool (0/1) | `0` | Dismiss when the live workspace changes underneath (e.g. a keybind) |
 | `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `gloview:allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card |
-| `show_empty` | bool (0/1) | `1` | Keep empty workspaces as strip cards |
+| `show_empty` | bool (0/1) | `1` | Keep empty workspaces as strip cards. Has no effect while `dynamic_workspaces` is on (which it is by default) — set that to `0` to get the old always-list-everything strip back |
+| `dynamic_workspaces` | bool (0/1) | `1` | GNOME/hyprnome-style workspaces: only populated workspaces are listed and the strip always ends in one empty card (drawn as a workspace, not a `+`). Stepping onto it or dropping a window into it creates it and a fresh empty tail appears; workspaces you empty drop off the strip. Forces `show_empty` off. Pair with `autodelete_empty` if you also want workspaces your config pins to be destroyed, not just hidden |
+| `autodelete_empty` | bool (0/1) | `1` | Let Hyprland reap empty workspaces this monitor still pins. Hyprland already destroys unpinned empties on its own, so this only affects ones held by a `persistent:true` rule (and gloview's own abandoned trailing workspace) — the "empty ones get deleted automatically" half of GNOME-style workspaces. **Releasing a persistent workspace lasts until your next config reload — set this to `0` if you keep `persistent:true` workspaces you want left alone.** Skips the displayed workspace, anything visible on any monitor, workspaces holding any window (mapped or not), scratchpads, named workspaces, and other monitors' workspaces |
+| `show_workspace_labels` | bool (0/1) | `1` | Workspace names above the strip cards. Off frees the label band, so the cards grow into it |
+| `show_window_labels` | bool (0/1) | `1` | Window title pill under a hovered/selected preview |
 | `show_special` | bool (0/1) | `0` | Include the special (scratchpad) workspace as a strip card |
 | `strip_all_card` | bool (0/1) | `0` | Show a leading "All workspaces" card on the strip that toggles the expo view |
 | `drag_to_swap` | bool (0/1) | `1` | Grid mode: dropping a preview onto another swaps the two windows' places |
@@ -150,6 +172,11 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 preview_round  = 12,
                 blur           = 1,
 
+                switch_animation = 1,
+                switch_duration  = 260,
+                move_animation   = 1,
+                move_duration    = 240,
+
                 anchor           = "top",
                 strip_offset     = 0,
                 strip_height     = 150,
@@ -178,6 +205,10 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
 
                 show_all_workspaces     = 0,
                 show_empty              = 1,
+                dynamic_workspaces      = 1,
+                autodelete_empty        = 1,
+                show_workspace_labels   = 1,
+                show_window_labels      = 1,
                 show_special            = 0,
                 strip_all_card          = 1,
                 drag_to_swap            = 1,
@@ -201,6 +232,7 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 strip_active_border_size = 2,
                 strip_hover_border_size  = 2,
                 strip_plus_color    = 0xd0eef4ff,
+                preview_bg          = 0xff14181f,
                 shadow_color        = 0x70000000,
                 hover_border        = 0xf0ffffff,
                 hover_border_size   = 3,
@@ -223,6 +255,11 @@ plugin {
         duration = 200
         preview_round = 12
         blur = 1
+
+        switch_animation = 1
+        switch_duration  = 260
+        move_animation   = 1
+        move_duration    = 240
 
         anchor = top
         strip_offset = 0
@@ -252,6 +289,10 @@ plugin {
 
         show_all_workspaces     = 0
         show_empty              = 1
+        dynamic_workspaces      = 1
+        autodelete_empty        = 1
+        show_workspace_labels   = 1
+        show_window_labels      = 1
         show_special            = 0
         strip_all_card          = 0
         drag_to_swap            = 1
@@ -275,6 +316,7 @@ plugin {
         strip_active_border_size = 2
         strip_hover_border_size  = 2
         strip_plus_color    = 0xd0eef4ff
+        preview_bg          = 0xff14181f
         shadow_color        = 0x70000000
         hover_border        = 0xf0ffffff
         hover_border_size   = 3
