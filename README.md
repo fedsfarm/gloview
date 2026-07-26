@@ -52,9 +52,14 @@ Dispatchers: `gloview:toggle`, `gloview:open`, `gloview:close`, `gloview:desktop
 Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`
 
 Workspace navigation: `gloview:next`, `gloview:prev`, `gloview:setworkspace <id>`
-(or `hyprctl gloviewnext` / `gloviewprev`). Like `tab` and the scroll wheel these
-move the *displayed* workspace and commit it to the live desktop when the overview
-closes; they do nothing while it is closed.
+(or `hyprctl gloviewnext` / `gloviewprev`). **Inside** the overview they behave like
+`tab` and the scroll wheel: they move the *displayed* workspace and commit it to the
+live desktop on close. **Outside** it they switch the live desktop right away, walking
+the same ordered list the strip shows — so one pair of binds drives workspaces
+everywhere. With `dynamic_workspaces` on, stepping past the last populated workspace
+lands you on a fresh empty one and the workspace you left behind is reaped if you
+emptied it (`gloview:setworkspace` never creates; it only switches to a workspace that
+already exists on the monitor).
 
 Lua:
 
@@ -136,9 +141,9 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `key_workspace` | key names | `1,2,3,4,5,6,7,8,9,0` | Each key switches to the Nth strip card's workspace, for real (slot position = card index) |
 | `exit_on_click` | bool (0/1) | `1` | Click on empty space dismisses the overview |
 | `exit_on_switch` | bool (0/1) | `0` | Dismiss when the live workspace changes underneath (e.g. a keybind) |
-| `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `gloview:allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card |
+| `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `gloview:allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card. Picking a preview here follows it: the overview closes onto that window's workspace |
 | `show_empty` | bool (0/1) | `1` | Keep empty workspaces as strip cards. Has no effect while `dynamic_workspaces` is on (which it is by default) — set that to `0` to get the old always-list-everything strip back |
-| `dynamic_workspaces` | bool (0/1) | `1` | GNOME/hyprnome-style workspaces: only populated workspaces are listed and the strip always ends in one empty card (drawn as a workspace, not a `+`). Stepping onto it or dropping a window into it creates it and a fresh empty tail appears; workspaces you empty drop off the strip. Forces `show_empty` off. Pair with `autodelete_empty` if you also want workspaces your config pins to be destroyed, not just hidden |
+| `dynamic_workspaces` | bool (0/1) | `1` | GNOME/hyprnome-style workspaces: only populated workspaces are listed and the strip ends in one empty card (drawn as a workspace, not a `+`). Stepping onto it or dropping a window into it creates it; the *next* empty card only appears once a window actually lands there, so you never see two blank desktops in a row, and emptying it again takes the extra card back away. Workspaces you empty drop off the strip. Forces `show_empty` off. Pair with `autodelete_empty` if you also want workspaces your config pins to be destroyed, not just hidden |
 | `autodelete_empty` | bool (0/1) | `1` | Let Hyprland reap empty workspaces this monitor still pins. Hyprland already destroys unpinned empties on its own, so this only affects ones held by a `persistent:true` rule (and gloview's own abandoned trailing workspace) — the "empty ones get deleted automatically" half of GNOME-style workspaces. **Releasing a persistent workspace lasts until your next config reload — set this to `0` if you keep `persistent:true` workspaces you want left alone.** Skips the displayed workspace, anything visible on any monitor, workspaces holding any window (mapped or not), scratchpads, named workspaces, and other monitors' workspaces |
 | `show_workspace_labels` | bool (0/1) | `1` | Workspace names above the strip cards. Off frees the label band, so the cards grow into it |
 | `show_window_labels` | bool (0/1) | `1` | Window title pill under a hovered/selected preview |

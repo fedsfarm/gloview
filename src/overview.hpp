@@ -73,8 +73,10 @@ class Overview {
     void toggleAllWorkspaces(); // open (or, if already open, toggle) the all-workspaces "expo" main view
 
     // Workspace navigation, exposed as dispatchers / lua (gloview:next, gloview:prev,
-    // gloview:setworkspace). Like tab / the scroll wheel these move the DISPLAYED
-    // workspace only; the live desktop follows when the overview closes. No-op closed.
+    // gloview:setworkspace). While the overview is UP these move the DISPLAYED workspace
+    // (like tab / the scroll wheel) and the live desktop follows on close. While it is
+    // CLOSED they switch the live desktop directly, walking the same ordered list the strip
+    // would show — so one keybind drives workspaces both in and out of the overview.
     void nextWorkspace();
     void prevWorkspace();
     bool setWorkspace(int id); // false if no such workspace on this monitor
@@ -279,6 +281,7 @@ class Overview {
     double stripLabelH() const;         // band reserved above each card for its name (0 when labels are off)
     bool   dynamicWorkspaces() const;   // plugin:gloview:dynamic_workspaces (gnome/hyprnome-style empty-tail workspaces)
     void   autodeleteEmpty();           // plugin:gloview:autodelete_empty — let Hyprland reap empty workspaces this monitor still pins
+    bool   wsHasMappedWindows(const PHLWORKSPACE& ws) const; // a window actually on screen there (listing test)
     bool   workspaceOccupied(const PHLWORKSPACE& ws) const; // any window at all on it (mapped or not)
     int    nextWorkspaceId() const;     // lowest free workspace id (>= 1)
     int    resolveNewId(int wanted) const; // the id a create-on-use card advertised, unless it got taken meanwhile
@@ -329,11 +332,17 @@ class Overview {
     int    keyIndex(int keycode, uint32_t mods, const char* cfgName, const char* fallback) const;   // 0-based position of keycode in the list, else -1 (number-row → strip card N)
     void   moveSelection(int dx, int dy);     // step the selection cursor to the nearest tile in a direction
     void   activateSelection();               // focus the selected window and dismiss
+    void   activateWindow(const PHLWINDOW& w, bool keybind); // …the shared path: follow the window's workspace, then dismiss + focus
     void   syncFocus() const;                 // point Hyprland's real focus at the selected tile (passthrough keybinds)
     void   closeTileWindow(int i);            // send-close a tile's window, then reflow the rest
     void   replayReflow(std::vector<std::pair<PHLWINDOW, LRect>>& oldBoxes); // glide tiles into new slots after a removal
     void   syncTiles();                       // add/drop tiles when the displayed workspace's window set changes, then reflow
     void   stepWorkspace(int dir);            // scroll-wheel over the main area: show prev/next workspace card
+    // gloview:next / gloview:prev with the overview CLOSED: walk the LIVE desktop through the
+    // same ordered list the strip would show (dynamic_workspaces' empty tail included).
+    std::vector<PHLWORKSPACE> liveWorkspaceList(const PHLMONITOR& m) const;
+    bool                      stepLiveWorkspace(int dir);
+    PHLMONITOR                activeMonitor() const; // focused monitor, else the one under the cursor
     void   hideLayers();                      // fade out Top/Overlay layer surfaces (bars) per config
     void   restoreLayers();                   // restore the alphas hideLayers() saved
     void   restoreFill();                     // reset m_fillIgnoreSmall on every window (see renderWindowLive)

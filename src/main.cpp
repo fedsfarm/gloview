@@ -77,7 +77,8 @@ SDispatchResult dispPrev(std::string) {
         g_overview->prevWorkspace();
     return {.success = true};
 }
-// gloview:setworkspace <id> — show that workspace in the overview.
+// gloview:setworkspace <id> — show that workspace in the overview; switch the live desktop to
+// it when the overview is closed.
 SDispatchResult dispSetWorkspace(std::string arg) {
     if (!g_overview)
         return {.success = true};
@@ -254,8 +255,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(handle, "gloview:close", dispClose);
     HyprlandAPI::addDispatcherV2(handle, "gloview:desktop", dispDesktop); // toggle the free-arrange desktop mode
     HyprlandAPI::addDispatcherV2(handle, "gloview:allworkspaces", dispAllWorkspaces); // open/toggle the all-workspaces expo view
-    // Workspace navigation inside the overview (no-ops while it is closed). Like tab and the
-    // scroll wheel these move the DISPLAYED workspace; the live desktop follows on close.
+    // Workspace navigation. Inside the overview these move the DISPLAYED workspace (like tab
+    // and the scroll wheel) and the live desktop follows on close; with the overview CLOSED
+    // they switch the live desktop straight away, stepping the same ordered list the strip
+    // shows — under dynamic_workspaces that includes walking onto a fresh empty workspace.
     HyprlandAPI::addDispatcherV2(handle, "gloview:next", dispNext);
     HyprlandAPI::addDispatcherV2(handle, "gloview:prev", dispPrev);
     HyprlandAPI::addDispatcherV2(handle, "gloview:setworkspace", dispSetWorkspace);

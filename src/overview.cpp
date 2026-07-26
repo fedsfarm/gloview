@@ -563,7 +563,19 @@ void Overview::autodeleteEmpty() {
     }
 }
 
-// Any window at all lives here? Deliberately broader than buildStrip's wsHasWindows(): a
+// "Is this workspace worth listing?" — a window that is actually on screen. Unmapped/hidden
+// ones don't count, so a workspace holding only those still reads as the empty tail. Shared by
+// buildStrip and the live (overview-closed) stepping so both list the same workspaces.
+bool Overview::wsHasMappedWindows(const PHLWORKSPACE& ws) const {
+    if (!ws)
+        return false;
+    for (const auto& win : Desktop::windowState()->windows())
+        if (win && win->m_isMapped && !win->isHidden() && win->m_workspace == ws)
+            return true;
+    return false;
+}
+
+// Any window at all lives here? Deliberately broader than wsHasMappedWindows(): a
 // workspace holding a window that is merely unmapped or hidden is NOT empty, and reaping it
 // out from under that window would be far worse than leaving a stale card up.
 bool Overview::workspaceOccupied(const PHLWORKSPACE& ws) const {
@@ -738,7 +750,10 @@ void Overview::open() {
 
     buildTiles();
     buildStrip();
-    if (m_tiles.empty() && m_strip.size() <= 1) // nothing to show
+    // Nothing to show at all. (Not "<= 1 card": with dynamic_workspaces a bare desktop lists
+    // exactly one card — the empty workspace you are on, with no create-on-use tail behind
+    // it — and that must still open.)
+    if (m_tiles.empty() && m_strip.empty())
         return;
 
     layoutTiles();
@@ -931,12 +946,7 @@ void Overview::buildStrip() {
     const bool dynamic     = dynamicWorkspaces();
     const bool showEmpty   = !dynamic && cfgInt("plugin:gloview:show_empty", 1) != 0;
     const bool showSpecial = cfgInt("plugin:gloview:show_special", 0) != 0;
-    const auto wsHasWindows = [](const PHLWORKSPACE& w) {
-        for (const auto& win : Desktop::windowState()->windows())
-            if (win && win->m_isMapped && !win->isHidden() && win->m_workspace == w)
-                return true;
-        return false;
-    };
+    const auto wsHasWindows = [this](const PHLWORKSPACE& w) { return wsHasMappedWindows(w); };
 
     std::vector<PHLWORKSPACE> wss;
     for (const auto& wref : State::workspaceState()->workspaces()) {
@@ -993,7 +1003,14 @@ void Overview::buildStrip() {
     // dynamic_workspaces it is drawn as an ordinary EMPTY workspace card carrying the id it
     // will take, so the strip always ends in one blank desktop you can step onto or drop a
     // window into (gnome / hyprnome behaviour). Either way it materialises on use.
-    StripItem plus;
+    //
+    // …but only ONE empty desktop at a time. Stepping onto the tail used to materialise it AND
+    // immediately grow a fresh tail behind it, so the strip ended in two blank cards and the
+    // one you were standing on looked duplicated. When the highest-id listed workspace is
+    // already empty it IS the tail, so no create-on-use card is appended; putting a window on
+    // it makes the next one appear (and emptying it again takes it back away).
+    const bool haveEmptyTail = dynamic && !wss.empty() && wss.back()->m_id > 0 && !wsHasWindows(wss.back());
+    StripItem  plus;
     plus.isPlus = true;
     plus.isNew  = dynamic;
     if (dynamic) {
@@ -1007,7 +1024,8 @@ void Overview::buildStrip() {
             ++tail;
         plus.id = tail;
     }
-    m_strip.push_back(std::move(plus));
+    if (!haveEmptyTail)
+        m_strip.push_back(std::move(plus));
 
     // render workspace name labels (cached textures) up front
     if (g_pHyprOpenGL && g_pHyprRenderer && showWorkspaceLabels()) {
@@ -2443,10 +2461,8 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             damage(); // dropped in empty space → tile snaps back to its slot
             return true;
         }
-        // a plain click → focus that window and dismiss
-        close();
-        if (w)
-            Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
+        // a plain click → follow that window's workspace, focus it and dismiss
+        activateWindow(w, false);
         return true;
     }
 
@@ -2649,24 +2665,144 @@ void Overview::commitWorkspace() {
     settle(ws);
 }
 
-// gloview:next / gloview:prev — same semantics as tab and the scroll wheel: move the
-// DISPLAYED workspace, commit to the live desktop on close. No-op while closed.
+// gloview:next / gloview:prev — while the overview is up, same semantics as tab and the
+// scroll wheel: move the DISPLAYED workspace, commit to the live desktop on close. While it
+// is closed the same binds switch the live desktop, so one key drives workspaces everywhere.
 void Overview::nextWorkspace() {
     if (m_active && m_opening)
         stepWorkspace(1);
+    else
+        stepLiveWorkspace(1);
 }
 
 void Overview::prevWorkspace() {
     if (m_active && m_opening)
         stepWorkspace(-1);
+    else
+        stepLiveWorkspace(-1);
+}
+
+// The monitor the user is on: keyboard focus first (these arrive from keybinds), cursor
+// position as the fallback — matching what open() picks.
+PHLMONITOR Overview::activeMonitor() const {
+    if (const auto m = Desktop::focusState()->monitor())
+        return m;
+    return State::monitorState()->query().vec(Pointer::mgr()->position()).run();
+}
+
+// The monitor's workspaces in the order the strip lists them: sorted by id, and under
+// dynamic_workspaces narrowed to the populated ones (plus whichever is active, even if it is
+// empty) — exactly buildStrip's rule, so stepping in and out of the overview walks the same
+// sequence. The create-on-use tail is NOT in here; stepLiveWorkspace appends it.
+std::vector<PHLWORKSPACE> Overview::liveWorkspaceList(const PHLMONITOR& m) const {
+    std::vector<PHLWORKSPACE> wss;
+    if (!m)
+        return wss;
+    const auto cur      = m->m_activeWorkspace;
+    const bool dynamic   = dynamicWorkspaces();
+    const bool showEmpty = !dynamic && cfgInt("plugin:gloview:show_empty", 1) != 0;
+
+    for (const auto& wref : State::workspaceState()->workspaces()) {
+        const auto ws = wref.lock();
+        if (!ws || ws->m_isSpecialWorkspace || ws->m_id <= 0) // scratchpads and named (-1337…) aren't stepped through
+            continue;
+        if (ws->m_monitor.lock() != m)
+            continue;
+        if (!showEmpty && ws != cur && !wsHasMappedWindows(ws))
+            continue;
+        wss.push_back(ws);
+    }
+    if (cur && cur->m_id > 0 && !cur->m_isSpecialWorkspace && std::none_of(wss.begin(), wss.end(), [&](const PHLWORKSPACE& ws) { return ws == cur; }))
+        wss.push_back(cur);
+
+    std::sort(wss.begin(), wss.end(), [](const PHLWORKSPACE& a, const PHLWORKSPACE& b) { return a->m_id < b->m_id; });
+    return wss;
+}
+
+// Step the LIVE desktop one workspace forward/back (wrapping), used when gloview:next /
+// gloview:prev fire with the overview closed. Under dynamic_workspaces the list gains a
+// trailing create-on-use slot whenever the last workspace is populated, so walking off the
+// end lands you on a fresh empty desktop (gnome / hyprnome); the one you left behind is
+// unpinned and empty, so Hyprland reaps it. Returns false when there was nowhere to go.
+bool Overview::stepLiveWorkspace(int dir) {
+    const auto m = activeMonitor();
+    if (!m || !m->m_activeWorkspace)
+        return false;
+    const auto cur = m->m_activeWorkspace;
+
+    // …plus a trailing create-on-use slot, unless the highest workspace is ALREADY the empty
+    // tail (same rule as the strip: never two blank desktops in a row).
+    auto       wss  = liveWorkspaceList(m);
+    const bool tail = dynamicWorkspaces() && (wss.empty() || wsHasMappedWindows(wss.back()));
+    const int  n    = static_cast<int>(wss.size()) + (tail ? 1 : 0);
+    if (n <= 1)
+        return false;
+
+    int pos = -1;
+    for (size_t i = 0; i < wss.size(); ++i)
+        if (wss[i] == cur)
+            pos = static_cast<int>(i);
+    if (pos < 0)
+        pos = 0;
+
+    int next = pos + (dir > 0 ? 1 : -1);
+    if (next < 0)
+        next = n - 1;
+    else if (next >= n)
+        next = 0;
+    if (next == pos)
+        return false;
+
+    // Fired during the close animation (m_active, no longer m_opening): deactivate() re-commits
+    // m_workspace at the end, so retarget it too or it would snap right back.
+    const auto land = [this](const PHLMONITOR& mon, const PHLWORKSPACE& ws) {
+        mon->changeWorkspace(ws, false, true, false);
+        if (m_active)
+            m_workspace = ws;
+    };
+
+    if (next < static_cast<int>(wss.size())) {
+        land(m, wss[next]);
+        return true;
+    }
+
+    // …the create-on-use tail: take the id right after the last one, like buildStrip.
+    int id = 1;
+    for (const auto& ws : wss)
+        if (ws->m_id >= id)
+            id = ws->m_id + 1;
+    while (State::workspaceState()->query().id(id).run())
+        ++id;
+    const auto fresh = State::workspaceState()->create(id, m->m_id, "", false);
+    if (!fresh)
+        return false;
+    // No persistence pin needed here (unlike the overview's held tail): changeWorkspace makes
+    // it the active workspace immediately, which is enough to keep it alive.
+    land(m, fresh);
+    dbg("stepped onto new workspace " + std::to_string(id));
+    return true;
 }
 
 // gloview:setworkspace <id>. Prefers the strip card, but falls back to any workspace living
 // on this monitor so the dispatcher isn't at the mercy of show_empty / dynamic_workspaces
 // hiding the target's card.
 bool Overview::setWorkspace(int id) {
-    if (!(m_active && m_opening))
-        return false;
+    // Closed: switch the live desktop, like gloview:next/prev now do. Only to a workspace that
+    // already exists on this monitor — creating one on demand is Hyprland's own `workspace`
+    // dispatcher's job.
+    if (!(m_active && m_opening)) {
+        const auto m = activeMonitor();
+        if (!m)
+            return false;
+        const auto ws = State::workspaceState()->query().id(id).run();
+        if (!ws || ws->m_monitor.lock() != m)
+            return false;
+        if (ws != m->m_activeWorkspace)
+            m->changeWorkspace(ws, false, true, false);
+        if (m_active) // mid-close: keep deactivate()'s re-commit from undoing this
+            m_workspace = ws;
+        return true;
+    }
     for (const auto& it : m_strip) {
         if (it.isAll || (it.isPlus && !it.isNew))
             continue;
@@ -2944,9 +3080,25 @@ void Overview::activateSelection() {
     PHLWINDOW w;
     if (m_selected >= 0 && m_selected < static_cast<int>(m_tiles.size()))
         w = m_tiles[m_selected].win.lock();
+    activateWindow(w, true);
+}
+
+// Picking a tile (click or key_activate) dismisses the overview onto that window's workspace.
+// In the all-workspaces (expo) view the tile can live on a workspace OTHER than the displayed
+// one, and close() commits m_workspace — so without retargeting it first the overview closed
+// back onto the workspace you started on and merely raised a window you could not see.
+void Overview::activateWindow(const PHLWINDOW& w, bool keybind) {
+    if (w) {
+        const auto m  = m_monitor.lock();
+        const auto ws = w->m_workspace;
+        // Special (scratchpad) workspaces are not something changeWorkspace should land on —
+        // focusing the window is enough; Hyprland keeps the scratchpad up on its own.
+        if (m && ws && !ws->m_isSpecialWorkspace && ws->m_monitor.lock() == m)
+            m_workspace = ws;
+    }
     close();
     if (w)
-        Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_KEYBIND);
+        Desktop::focusState()->fullWindowFocus(w, keybind ? Desktop::FOCUS_REASON_KEYBIND : Desktop::FOCUS_REASON_CLICK);
 }
 
 // Point Hyprland's REAL focus at the selected tile while the overview is up. passthrough
@@ -3226,8 +3378,15 @@ bool Overview::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& mon) const
     // check routes through this hook, so hiding here would bail it → empty tiles.
     if (m_capturing)
         return false;
-    if (!m_active || !w || mon != m)
+    if (!m_active || !w || !m)
         return false;
+    // Deliberately NOT scoped to `mon == m`. Hyprland renders a window on EVERY monitor its
+    // box overlaps, so a window straddling a monitor edge kept painting its overhang on the
+    // neighbouring output while the overview hid it here — it read as a duplicate of the
+    // preview. Every rule below keys off the window's WORKSPACE (which lives on OUR monitor),
+    // so suppressing those windows on all outputs is correct; windows owned by another
+    // monitor's workspace never match and keep rendering normally.
+    (void)mon;
     // hide the windows we draw previews for
     for (const auto& t : m_tiles)
         if (t.win.lock() == w)
