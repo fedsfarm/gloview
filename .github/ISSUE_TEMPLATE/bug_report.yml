@@ -1,0 +1,19 @@
+name: Bug report
+description: Report a problem with gloview
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. Please include your Hyprland version and any relevant config lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+      description: Optional — describe the behavior you expected.
+    validations:
+      required: false
