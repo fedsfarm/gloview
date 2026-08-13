@@ -1,0 +1,28 @@
+title: "[Idea]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests live here rather than in Issues. Bugs go to the issue tracker.
+  - type: textarea
+    id: idea
+    attributes:
+      label: What's the idea
+      description: What should gloview do that it doesn't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would this help
+      description: What's awkward or missing in your workflow right now?
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: How you picture it working
+      description: A rough sketch of the behaviour — keybinds, config options, what you'd see on screen. Not a spec.
+    validations:
+      required: false
