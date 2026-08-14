@@ -26,7 +26,19 @@
   in {
     packages = eachSystem (system: let
       pkgs = pkgsFor.${system};
-      hyprlandPkg = hyprland.packages.${system}.hyprland;
+      # Upstream's tagged flake package does not build in a nix sandbox as-is: Hyprland
+      # 0.56.2's CMake asks for `find_package(glaze 7...<8)` while its own nixpkgs pin ships
+      # glaze 8, so the check fails and the FetchContent fallback tries to `git clone` glaze
+      # (no git, no network in the sandbox) -> "could not find git for clone of glaze".
+      # nixpkgs' own hyprland 0.56.2 relaxes that exact constraint and builds fine against
+      # glaze 8, so mirror its patch here instead of pinning an older Hyprland.
+      hyprlandPkg = hyprland.packages.${system}.hyprland.overrideAttrs (old: {
+        postPatch =
+          (old.postPatch or "")
+          + ''
+            substituteInPlace CMakeLists.txt --replace-fail "glaze 7...<8" "glaze"
+          '';
+      });
     in {
       # mkHyprlandPlugin now lives in nixpkgs (pkgs.hyprlandPlugins.mkHyprlandPlugin), not in
       # the Hyprland flake's `lib`. It is built on hyprland.stdenv.mkDerivation and auto-adds
