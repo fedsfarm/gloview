@@ -329,6 +329,14 @@ plugin {
 }
 ```
 
+## Contribute
+
+If you want to contribute, you can check out the feature requests by users in the Discussions tab, or implement your own feature
+
+It will be merged if it builds and fits. If you aren't sure, you can contact me (see below)
+
+AI code is allowed if it's submitted and tested by a human
+
 ## Donate
 
 #### XMR:

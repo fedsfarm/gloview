@@ -4,7 +4,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Feature requests live here rather than in Issues. Bugs go to the issue tracker.
+        Feature requests live here, bugs go to the Issues
   - type: textarea
     id: idea
     attributes:
@@ -15,14 +15,14 @@ body:
   - type: textarea
     id: why
     attributes:
-      label: Why would this help
-      description: What's awkward or missing in your workflow right now?
+      label: Why?
+      description: What's missing in your workflow right now?
     validations:
       required: true
   - type: textarea
     id: shape
     attributes:
       label: How you picture it working
-      description: A rough sketch of the behaviour — keybinds, config options, what you'd see on screen. Not a spec.
+      description: Keybinds, config options, what you'd see on screen
     validations:
       required: false

@@ -1,19 +1,91 @@
 name: Bug report
-description: Report a problem with gloview
+description: Something in gloview is broken, crashes, or misbehaves
 labels:
   - bug
 body:
-  - type: textarea
-    id: what-happened
+  - type: markdown
     attributes:
-      label: What happened?
-      description: Describe the bug. Please include your Hyprland version and any relevant config lines.
+      value: |
+        Feature requests belong in [Discussions -> Ideas](https://github.com/fedsfarm/gloview/discussions/categories/ideas)
+        The plugin must be built on the latest Hyprland release (not commit)
+  - type: input
+    id: hyprland-version
+    attributes:
+      label: Hyprland version
+      description: Output of `hyprctl version | head -n 2`.
+      placeholder: Hyprland X.XX.X buildt from branch vX.XX.X at commit X
+    validations:
+      required: true
+  - type: input
+    id: gloview-version
+    attributes:
+      label: gloview version
+      description: Plugin version or commit. `hyprctl plugin list` shows the loaded version
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install it?
+      options:
+        - hyprpm
+        - AUR
+        - Nix
+        - Manual cmake build
+        - Other
     validations:
       required: true
   - type: textarea
-    id: expected
+    id: what-happened
     attributes:
-      label: What did you expect instead?
-      description: Optional — describe the behavior you expected.
+      label: What happened
+      description: What went wrong, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Which dispatcher or bind, and what you did in the overview
+      placeholder: |
+        1. bind = SUPER, TAB, gloview:toggle
+        2. Open the overview
+        3. Scroll to workspace 10 and press Enter
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Your gloview config
+      description: Every `plugin:gloview:*` line you have set
+      render: lua
     validations:
       required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Set `plugin:gloview:debug_logs = 1`, reproduce, then paste the `[gloview]`
+        lines from `hyprctl rollinglog`. For a crash, paste the backtrace instead.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU / driver and monitor layout
+      description: Rendering and layout bugs are usually one or the other.
+      placeholder: AMD RX 6700 XT, mesa 24.2, one monitor, 1x and 1.5x scale
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: gloview is built against the stable Hyprland release I am running
+          required: true
+        - label: I searched open and closed issues for this
+          required: true

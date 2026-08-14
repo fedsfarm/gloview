@@ -4,10 +4,11 @@
   inputs = {
     # Pin a tagged Hyprland release, not `main`: ABI must match the compositor, and main's
     # dep tree is intermittently unbuildable (e.g. a missing pango buildInput in
-    # hyprland-guiutils broke it on 2026-06-27). v0.55.4 is the version this was developed +
-    # proven against (`nix build .#gloview` succeeds on real NixOS). Downstream should set
-    # `inputs.hyprland.follows` to build the plugin against THEIR exact Hyprland.
-    hyprland.url = "github:hyprwm/Hyprland?ref=v0.55.4";
+    # hyprland-guiutils broke it on 2026-06-27). v0.56.2 is the version this targets: 0.56
+    # dropped CWindow::m_snapshotFB, so the plugin owns the snapshot framebuffers itself and
+    # will not compile against 0.55.x. Downstream should set `inputs.hyprland.follows` to
+    # build the plugin against THEIR exact Hyprland.
+    hyprland.url = "github:hyprwm/Hyprland?ref=v0.56.2";
     nixpkgs.follows = "hyprland/nixpkgs";
     systems.follows = "hyprland/systems";
   };

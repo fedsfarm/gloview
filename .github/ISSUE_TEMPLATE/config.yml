@@ -1,5 +1,11 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Feature request / idea
+  - name: Feature request or idea
     url: https://github.com/fedsfarm/gloview/discussions/categories/ideas
-    about: Have an idea or want something new? Post it in Discussions instead of opening an issue.
+    about: Use Discussions for that
+  - name: Question or help with config
+    url: https://github.com/fedsfarm/gloview/discussions/categories/q-a
+    about: Binds, dispatchers, plugin:gloview options. Ask in Discussions
+  - name: Matrix chat
+    url: https://escape.feds.farm/#main:feds.farm
+    about: For anything quicker than a thread
