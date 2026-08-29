@@ -149,6 +149,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:padding_top", Config::INTEGER{40});    // gap below the strip
     addInt("plugin:gloview:padding_bottom", Config::INTEGER{70}); // bottom margin
     addFloat("plugin:gloview:max_scale", Config::FLOAT{1.0F});    // never upscale past real*this
+    addStr("plugin:gloview:preview_filter", "box4");              // box4 | box16 | linear
     addInt("plugin:gloview:duration", Config::INTEGER{360});      // open/close animation (ms)
     addInt("plugin:gloview:preview_round", Config::INTEGER{12});
     addFloat("plugin:gloview:blur", Config::FLOAT{1.0F});         // backdrop/strip blur strength 0..1 (0 = off; floats allowed)
