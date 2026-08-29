@@ -1,4 +1,5 @@
 #include "overview.hpp"
+#include "preview_filter.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -161,11 +162,71 @@ LRect intersectRect(const LRect& a, const LRect& b) {
     return LRect{x0, y0, std::max(0.0, x1 - x0), std::max(0.0, y1 - y0)};
 }
 
+// Hyprland applies extra UV corrections while a surface and its window geometry disagree.
+// Use the custom filter only when its basic viewport UVs match the normal surface path.
+bool hasStablePreviewUV(const PHLWINDOW& window, const SP<CWLSurfaceResource>& surface, bool mainSurface,
+                        const CBox& texBoxLogical, const CBox& texBoxPx, const PHLMONITORREF& monitor) {
+    if (!window || !surface || !monitor || window->sizeAnimation()->isBeingAnimated())
+        return false;
+
+    const auto& drag = g_layoutManager->dragController();
+    if (drag && drag->target() == window->m_target && drag->mode() >= MBIND_RESIZE)
+        return false;
+
+    const auto& state = surface->m_current;
+    if (window->m_isX11 && state.viewport.hasSource)
+        return false;
+    if (texBoxLogical.size() != state.size)
+        return false;
+
+    Vector2D expectedPx;
+    if (state.viewport.hasDestination)
+        expectedPx = (state.viewport.destination * monitor->m_scale).round();
+    else if (state.viewport.hasSource)
+        expectedPx = (state.viewport.source.size() * monitor->m_scale).round();
+    else if (mainSurface && window->getReportedSize() != state.size)
+        expectedPx = (state.size * monitor->m_scale).round();
+    else if (mainSurface)
+        expectedPx = (window->getReportedSize() * monitor->m_scale).round();
+    else
+        expectedPx = texBoxPx.size();
+
+    if (texBoxPx.size() != expectedPx)
+        return false;
+
+    return true;
+}
+
+// Mirrors Hyprland's MISALIGNEDFSV1 correction in ElementRenderer: a fractional-scale
+// client can submit a scale-1 buffer that differs from the rounded projected size by one
+// or two pixels. Trim/extend the bottom-right UV so the source span matches the projected
+// surface exactly. Hyprland uses this with nearest-neighbour sampling; our corrected span
+// is instead safe to feed through box4/box16.
+void fixFractionalScaleUV(const SP<CWLSurfaceResource>& surface, const PHLMONITORREF& monitor,
+                          const Vector2D& projectedSizePx, Vector2D& uvMin, Vector2D& uvMax) {
+    if (!surface || !monitor)
+        return;
+
+    const auto& state      = surface->m_current;
+    const auto& bufferSize = state.bufferSize;
+    if (bufferSize.x <= 0.0 || bufferSize.y <= 0.0 || std::floor(monitor->m_scale) == monitor->m_scale ||
+        state.scale != 1 || projectedSizePx == bufferSize)
+        return;
+
+    const auto delta = projectedSizePx - bufferSize;
+    if (std::abs(delta.x) >= 3.0 || std::abs(delta.y) >= 3.0)
+        return;
+
+    const Vector2D misalignment = (uvMax - uvMin) * bufferSize - projectedSizePx;
+    if (misalignment != Vector2D{})
+        uvMax -= misalignment / bufferSize;
+}
+
 // Render a window's LIVE surface tree scaled into `destPx`, clipped to `clipPx`
 // (both monitor PIXEL coords) via real CSurfacePassElements. No crop rect to drift,
 // so immune to snapshots' stale/mis-cropped tiles; works on hidden workspaces.
 void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& destPx, const CBox& clipPx, float alpha, const Time::steady_tp& when,
-                      double roundSlotPx = 0.0) {
+                      int previewFilterGrid, double roundSlotPx = 0.0) {
     if (!w || !mon || !w->m_isMapped || !w->wlSurface() || !w->wlSurface()->resource())
         return;
     if (!(destPx.w > 0 && destPx.h > 0))
@@ -233,14 +294,52 @@ void renderWindowLive(const PHLWINDOW& w, const PHLMONITOR& mon, const CBox& des
     data.surfaceCounter = 0;
 
     w->wlSurface()->resource()->breadthfirst(
-        [&data, &w](SP<CWLSurfaceResource> s, const Vector2D& offset, void*) {
+        [&data, &w, &clipPx, &modif, previewFilterGrid](SP<CWLSurfaceResource> s, const Vector2D& offset, void*) {
             if (!s || !s->m_current.texture || s->m_current.size.x < 1 || s->m_current.size.y < 1)
                 return;
             data.localPos    = offset;
             data.texture     = s->m_current.texture;
             data.surface     = s;
             data.mainSurface = s == w->wlSurface()->resource();
-            g_pHyprRenderer->m_renderPass.add(makeUnique<CSurfacePassElement>(data));
+
+            if (previewFilterGrid == 0 || data.texture->m_type == Render::TEXTURE_EXTERNAL) {
+                g_pHyprRenderer->m_renderPass.add(makeUnique<CSurfacePassElement>(data));
+                data.surfaceCounter++;
+                return;
+            }
+
+            // Match CSurfacePassElement's size, rounding and animated-subsurface rules.
+            CSurfacePassElement geometry(data);
+            const CBox          texBoxLogical = geometry.getTexBox();
+            CBox                targetPx = texBoxLogical;
+            targetPx.scale(data.pMonitor->m_scale);
+            targetPx.round();
+            const bool stableUV = hasStablePreviewUV(w, s, data.mainSurface, texBoxLogical, targetPx, data.pMonitor);
+            const Vector2D projectedSizePx = targetPx.size();
+            modif.applyToBox(targetPx);
+
+            Vector2D uvMin{0.0, 0.0};
+            Vector2D uvMax{1.0, 1.0};
+            const auto& viewport = s->m_current.viewport;
+            const auto& bufferSize = s->m_current.bufferSize;
+            if (viewport.hasSource && bufferSize.x > 0.0 && bufferSize.y > 0.0) {
+                uvMin = Vector2D{viewport.source.x / bufferSize.x, viewport.source.y / bufferSize.y};
+                uvMax = Vector2D{(viewport.source.x + viewport.source.width) / bufferSize.x,
+                                 (viewport.source.y + viewport.source.height) / bufferSize.y};
+            }
+            if (stableUV)
+                fixFractionalScaleUV(s, data.pMonitor, projectedSizePx, uvMin, uvMax);
+
+            const Vector2D sampledPixels = (uvMax - uvMin) * data.texture->m_size;
+            const bool minifying = sampledPixels.x > targetPx.w * 1.05 || sampledPixels.y > targetPx.h * 1.05;
+            // Native-sized textures stay on Hyprland's normal path.
+            if (stableUV && minifying && targetPx.w > 1.0 && targetPx.h > 1.0) {
+                g_pHyprRenderer->m_renderPass.add(PreviewFilter::makePass(
+                    data, targetPx, clipPx, uvMin, uvMax, data.mainSurface && !data.dontRound ? data.rounding : 0.0,
+                    previewFilterGrid));
+            } else {
+                g_pHyprRenderer->m_renderPass.add(makeUnique<CSurfacePassElement>(data));
+            }
             data.surfaceCounter++;
         },
         nullptr);
@@ -349,6 +448,7 @@ Overview::~Overview() {
     // inactive overview and no dangling refs.
     m_active  = false;
     m_opening = false;
+    PreviewFilter::reset();
     restoreLayers(); // never leave a bar stuck at alpha 0 if we're torn down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
     if (const auto ws = m_newWs.lock()) // don't leak a persistent workspace either
@@ -1570,6 +1670,9 @@ void Overview::renderStage(eRenderStage stage) {
     if (stage != RENDER_LAST_MOMENT)
         return;
 
+    const auto previewFilter = cfgStr("plugin:gloview:preview_filter", "box4");
+    m_previewFilterGrid = previewFilter == "box16" ? 4 : previewFilter == "box4" ? 2 : 0;
+
     updateAnimation();
     if (!m_active)
         return;
@@ -1785,7 +1888,7 @@ void Overview::renderStripWindows() const {
             const double stripRound = cropped ? 0.0 :
                                                 std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
                                                          std::min(slot.w, slot.h) * 0.35);
-            renderWindowLive(w, m, slotPx, clipPx, static_cast<float>(e), when, stripRound);
+            renderWindowLive(w, m, slotPx, clipPx, static_cast<float>(e), when, m_previewFilterGrid, stripRound);
         }
     }
 }
@@ -2011,7 +2114,7 @@ void Overview::renderMainWindows() const {
             continue;
         const LRect lb = tileContentBox(i, currentBox(m_tiles[i], static_cast<int>(i)));
         const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-        renderWindowLive(w, m, px, px, 1.0F, when, static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
+        renderWindowLive(w, m, px, px, 1.0F, when, m_previewFilterGrid, static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
     }
 }
 
@@ -2054,7 +2157,7 @@ void Overview::renderPrevWindows() const {
         if (!w || !w->m_isMapped || w->isHidden())
             continue;
         const CBox px((t.target.x + off.x) * scale, (t.target.y + off.y) * scale, t.target.w * scale, t.target.h * scale);
-        renderWindowLive(w, m, px, px, 1.0F, when, round);
+        renderWindowLive(w, m, px, px, 1.0F, when, m_previewFilterGrid, round);
     }
 }
 
@@ -2101,7 +2204,7 @@ void Overview::renderFlyWindow() const {
             continue;
         const LRect lb = flyBox(f);
         const CBox  px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-        renderWindowLive(w, m, px, px, 1.0F, when, flyRound(lb)); // opaque all the way — see renderFlyTile
+        renderWindowLive(w, m, px, px, 1.0F, when, m_previewFilterGrid, flyRound(lb)); // opaque all the way — see renderFlyTile
     }
 }
 
@@ -2126,7 +2229,8 @@ void Overview::renderDragWindow() const {
     const double scale = m->m_scale;
     const LRect  lb    = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
     const CBox   px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-    renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow(), static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
+    renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow(), m_previewFilterGrid,
+                     static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
 }
 
 bool Overview::isAboveLayer(const std::string& ns) const {

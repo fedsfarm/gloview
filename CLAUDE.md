@@ -89,7 +89,7 @@ takes down the whole session — prefer testing in a **nested** Hyprland instanc
 
 ## Architecture
 
-Three translation units, layered by Hyprland coupling:
+Four translation units, layered by Hyprland coupling:
 
 - **`src/main.cpp`** (~375 lines) — plugin entry points (`PLUGIN_INIT` / `PLUGIN_EXIT` /
   `PLUGIN_API_VERSION`) and nothing else. Registers all `plugin:gloview:*` config values,
@@ -100,6 +100,8 @@ Three translation units, layered by Hyprland coupling:
 - **`src/overview.{cpp,hpp}`** (~3450 lines) — the `Overview` class. All Hyprland-coupled
   logic: rendering, input, snapshot capture, animation, drag-and-drop, workspace ops.
   `overview.hpp` is the map of it, and its comments carry most of the hard-won reasoning.
+- **`src/preview_filter.{cpp,hpp}`** — scale-aware GPU downsampling for reduced live
+  previews, with Hyprland's normal surface pass as the compatibility fallback.
 - **`src/layout.{cpp,hpp}`** — **pure, Hyprland-independent** geometry. `LRect`, the
   `Engine` enum (`rows`/`grid`/`natural`), and `computeLayout()`. Add a layout engine here
   by extending `Engine` + `computeLayout` — the renderer and input code don't change.

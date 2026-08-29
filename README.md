@@ -99,6 +99,7 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `padding_top` | int (px) | `40` | Extra gap between the strip and the previews |
 | `padding_bottom` | int (px) | `70` | Bottom outer margin |
 | `max_scale` | float | `1.0` | Never enlarge a preview past real size × this |
+| `preview_filter` | `box4` \| `box16` \| `linear` | `box4` | Scale-aware GPU downsampling for reduced previews: `box4` uses a 2×2 kernel, `box16` uses a smoother but costlier 4×4 kernel, and `linear` restores Hyprland's normal single-sample path |
 | `duration` | int (ms) | `360` | Open/close animation length |
 | `preview_round` | int (px) | `12` | Window preview corner radius |
 | `blur` | float `0`..`1` | `1.0` | Backdrop + strip blur strength (`0` = off; fractions allowed) |
@@ -173,6 +174,7 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 padding_top    = 40,
                 padding_bottom = 70,
                 max_scale      = 1.0,
+                preview_filter = "box4",
                 duration       = 200,
                 preview_round  = 12,
                 blur           = 1,
@@ -257,6 +259,7 @@ plugin {
         padding_top = 40
         padding_bottom = 70
         max_scale = 1.0
+        preview_filter = box4
         duration = 200
         preview_round = 12
         blur = 1
