@@ -1,3 +1,13 @@
+[repository]
+name = "gloview"
+authors = ["Vergil"]
+# [hyprland commit, gloview commit]: Hyprland 0.56.x builds the last pre-0.57 gloview.
+commit_pins = [
+    ["36b2e0cfe0c6094dbc47bd42a437431315bb3087", "f08f38e242107bc4459813b4fb4e5e8ff7916dce"], # v0.56.0
+    ["5c9377c15f85c50648f35ca5a213754f95b93ca0", "f08f38e242107bc4459813b4fb4e5e8ff7916dce"], # v0.56.1
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "f08f38e242107bc4459813b4fb4e5e8ff7916dce"], # v0.56.2
+]
+
 [gloview]
 description = "Minimal macOS-style window overview"
 authors = ["Vergil"]

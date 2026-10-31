@@ -4,11 +4,11 @@
   inputs = {
     # Pin a tagged Hyprland release, not `main`: ABI must match the compositor, and main's
     # dep tree is intermittently unbuildable (e.g. a missing pango buildInput in
-    # hyprland-guiutils broke it on 2026-06-27). v0.56.2 is the version this targets: 0.56
-    # dropped CWindow::m_snapshotFB, so the plugin owns the snapshot framebuffers itself and
-    # will not compile against 0.55.x. Downstream should set `inputs.hyprland.follows` to
-    # build the plugin against THEIR exact Hyprland.
-    hyprland.url = "github:hyprwm/Hyprland?ref=v0.56.2";
+    # hyprland-guiutils broke it on 2026-06-27). v0.57.0 is the version this targets: 0.57
+    # moved per-frame render state into Render::CRenderContext and reworked workspace ids, so
+    # the plugin will not compile against 0.56.x. Downstream should set
+    # `inputs.hyprland.follows` to build the plugin against THEIR exact Hyprland.
+    hyprland.url = "github:hyprwm/Hyprland?ref=v0.57.0";
     nixpkgs.follows = "hyprland/nixpkgs";
     systems.follows = "hyprland/systems";
   };
@@ -26,19 +26,10 @@
   in {
     packages = eachSystem (system: let
       pkgs = pkgsFor.${system};
-      # Upstream's tagged flake package does not build in a nix sandbox as-is: Hyprland
-      # 0.56.2's CMake asks for `find_package(glaze 7...<8)` while its own nixpkgs pin ships
-      # glaze 8, so the check fails and the FetchContent fallback tries to `git clone` glaze
-      # (no git, no network in the sandbox) -> "could not find git for clone of glaze".
-      # nixpkgs' own hyprland 0.56.2 relaxes that exact constraint and builds fine against
-      # glaze 8, so mirror its patch here instead of pinning an older Hyprland.
-      hyprlandPkg = hyprland.packages.${system}.hyprland.overrideAttrs (old: {
-        postPatch =
-          (old.postPatch or "")
-          + ''
-            substituteInPlace CMakeLists.txt --replace-fail "glaze 7...<8" "glaze"
-          '';
-      });
+      # 0.56.2 needed a postPatch relaxing `find_package(glaze 7...<8)`; 0.57.0 asks for an
+      # unversioned `find_package(glaze QUIET)`, so the tagged package is used as-is (a
+      # leftover `--replace-fail` on that string would now FAIL the build).
+      hyprlandPkg = hyprland.packages.${system}.hyprland;
     in {
       # mkHyprlandPlugin now lives in nixpkgs (pkgs.hyprlandPlugins.mkHyprlandPlugin), not in
       # the Hyprland flake's `lib`. It is built on hyprland.stdenv.mkDerivation and auto-adds

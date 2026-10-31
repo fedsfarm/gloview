@@ -22,6 +22,10 @@
 namespace Render {
 class ITexture;
 class IFramebuffer;
+class CRenderContext;
+}
+namespace Event {
+struct SRenderStageEvent;
 }
 
 #include "layout.hpp"
@@ -82,24 +86,24 @@ class Overview {
     bool setWorkspace(int id); // false if no such workspace on this monitor
 
     // wired to Hyprland's event bus / render pass
-    void renderStage(eRenderStage stage);
-    void renderBackdrop() const;
-    void renderStrip() const;
-    void renderStripWindows() const; // live window surfaces inside the strip cards
-    void renderStripRings() const;  // card active/hover rings, over the card previews
-    void renderPreviews() const;  // static tiles' chrome (shadow/backing/title), drawn under the strip
-    void renderMainWindows() const; // live window surfaces for the main-area tiles
-    void renderPreviewRings() const; // tile hover/selection rings, over the main surfaces
-    void renderPrevPreviews() const;  // outgoing workspace's tile chrome during a switch slide
-    void renderPrevWindows() const;   // outgoing workspace's live surfaces during a switch slide
-    void renderFlyTile() const;   // the "moved to workspace" tile's chrome, drawn over the strip
-    void renderFlyWindow() const; // the "moved to workspace" tile's live surface
-    void renderDragTile() const;  // the picked-up tile's chrome, drawn over the strip
-    void renderDragWindow() const; // the picked-up tile's live surface
-    void renderDragRing() const;  // the picked-up tile's ring, over its surface
-    void renderCursorOnTop() const; // redraw the SW cursor over our overlay
+    void renderStage(const Event::SRenderStageEvent& ev);
+    void renderBackdrop(Render::CRenderContext& ctx) const;
+    void renderStrip(Render::CRenderContext& ctx) const;
+    void renderStripWindows(Render::CRenderContext& ctx) const; // live window surfaces inside the strip cards
+    void renderStripRings(Render::CRenderContext& ctx) const;  // card active/hover rings, over the card previews
+    void renderPreviews(Render::CRenderContext& ctx) const;  // static tiles' chrome (shadow/backing/title), drawn under the strip
+    void renderMainWindows(Render::CRenderContext& ctx) const; // live window surfaces for the main-area tiles
+    void renderPreviewRings(Render::CRenderContext& ctx) const; // tile hover/selection rings, over the main surfaces
+    void renderPrevPreviews(Render::CRenderContext& ctx) const;  // outgoing workspace's tile chrome during a switch slide
+    void renderPrevWindows(Render::CRenderContext& ctx) const;   // outgoing workspace's live surfaces during a switch slide
+    void renderFlyTile(Render::CRenderContext& ctx) const;   // the "moved to workspace" tile's chrome, drawn over the strip
+    void renderFlyWindow(Render::CRenderContext& ctx) const; // the "moved to workspace" tile's live surface
+    void renderDragTile(Render::CRenderContext& ctx) const;  // the picked-up tile's chrome, drawn over the strip
+    void renderDragWindow(Render::CRenderContext& ctx) const; // the picked-up tile's live surface
+    void renderDragRing(Render::CRenderContext& ctx) const;  // the picked-up tile's ring, over its surface
+    void renderCursorOnTop(Render::CRenderContext& ctx) const; // redraw the SW cursor over our overlay
     bool isAboveLayer(const std::string& ns) const;
-    void renderAboveLayers() const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
+    void renderAboveLayers(Render::CRenderContext& ctx) const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
     bool onMouseButton(const IPointer::SButtonEvent& e);
     bool onMouseAxis(const IPointer::SAxisEvent& e); // scroll the workspace strip when it overflows
     void onMouseMove();
@@ -325,8 +329,8 @@ class Overview {
     bool   isFlying(const PHLWINDOW& w) const; // destination card must not draw a window still in flight
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
-    void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/backing/title)
-    void   drawPreviewRing(size_t i, const LRect& slot, bool lift) const; // hover/selection ring, over the live surface
+    void   drawPreviewTile(Render::CRenderContext& ctx, size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/backing/title)
+    void   drawPreviewRing(Render::CRenderContext& ctx, size_t i, const LRect& slot, bool lift) const; // hover/selection ring, over the live surface
     LRect  stripCardBox(size_t i, const Vector2D& slide, const Vector2D& scroll) const; // card box incl. scroll + pop-in
     void   switchToWorkspace(const StripItem& it);
     void   commitWorkspace();                 // push the displayed workspace to the live desktop, warping Hyprland's own slide away

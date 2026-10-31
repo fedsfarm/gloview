@@ -7,9 +7,11 @@
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/protocols/ColorManagement.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/render/Context.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/SurfaceBufferUse.hpp>
 #include <hyprland/src/render/Texture.hpp>
 
 using Render::GL::g_pHyprOpenGL;
@@ -171,7 +173,7 @@ bool swapsAxes(eTransform transform) {
         transform == HYPRUTILS_TRANSFORM_FLIPPED_90 || transform == HYPRUTILS_TRANSFORM_FLIPPED_270;
 }
 
-bool needsColorConversion(const SurfaceData& data) {
+bool needsColorConversion(Render::CRenderContext& ctx, const SurfaceData& data) {
     static auto enableCM = CConfigValue<Config::INTEGER>("render:cm_enabled");
     if (!*enableCM || data.fallback.pMonitor->doesNoShaderCM())
         return false;
@@ -182,7 +184,7 @@ bool needsColorConversion(const SurfaceData& data) {
     if (!source)
         source = NColorManagement::getDefaultImageDescription();
 
-    const auto& currentFB = g_pHyprRenderer->m_renderData.currentFB;
+    const auto& currentFB = ctx.m_data.currentFB;
     auto        target = data.fallback.pMonitor->workBufferImageDescription();
     if (currentFB) {
         const auto description = currentFB->imageDescription();
@@ -193,11 +195,11 @@ bool needsColorConversion(const SurfaceData& data) {
     return target && source->needsCM(target);
 }
 
-bool drawSurface(const SurfaceData& data) {
+bool drawSurface(Render::CRenderContext& ctx, const SurfaceData& data) {
     const auto& fallback = data.fallback;
     const auto& texture  = fallback.texture;
     if (!texture || !texture->ok() || texture->m_type == Render::TEXTURE_EXTERNAL || !fallback.surface ||
-        !fallback.pMonitor || data.boxPx.w <= 1.0 || data.boxPx.h <= 1.0 || needsColorConversion(data) || !ensureShader())
+        !fallback.pMonitor || data.boxPx.w <= 1.0 || data.boxPx.h <= 1.0 || needsColorConversion(ctx, data) || !ensureShader())
         return false;
 
     const auto surface = Desktop::View::CWLSurface::fromResource(fallback.surface);
@@ -205,17 +207,15 @@ bool drawSurface(const SurfaceData& data) {
                                        (surface ? surface->m_alphaModifier * surface->m_overallOpacity : 1.0F),
                                    0.0F, 1.0F);
 
-    auto transform = texture->m_transform;
-    if (g_pHyprRenderer->monitorTransformEnabled()) {
-        const auto monitorTransform = Math::wlTransformToHyprutils(Math::invertTransform(fallback.pMonitor->m_transform));
-        transform = Math::composeTransform(monitorTransform, transform);
-    }
+    // Same as 0.57's renderTextureInternal: the inverse buffer transform, no monitor compose
+    // (the projection applies the monitor transform now).
+    const auto transform = Math::invertTransform(texture->m_transform);
     // The filter footprint is expressed in destination X/Y. Rotated textures swap those
     // axes, so leave them to Hyprland's normal surface renderer.
     if (swapsAxes(transform))
         return false;
 
-    const auto& projection = g_pHyprRenderer->projectBoxToTarget(data.boxPx, transform);
+    const auto& projection = g_pHyprRenderer->projectBoxToTarget(ctx, data.boxPx, transform);
 
     g_pHyprOpenGL->useShader(g_shader.shader);
     g_shader.shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, projection.getMatrix());
@@ -242,18 +242,18 @@ bool drawSurface(const SurfaceData& data) {
     g_pHyprRenderer->blend(true);
     const auto clipped = intersection(data.boxPx, data.clipPx);
     if (clipped.w > 0.0 && clipped.h > 0.0) {
-        g_pHyprOpenGL->scissor(clipped);
+        g_pHyprOpenGL->scissor(ctx, clipped);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
 
-    g_pHyprOpenGL->scissor(static_cast<const pixman_box32*>(nullptr));
+    g_pHyprOpenGL->scissor(ctx, static_cast<const pixman_box32*>(nullptr));
     glBindVertexArray(0);
     texture->unbind();
 
-    if (!g_pHyprRenderer->m_bBlockSurfaceFeedback)
+    if (!ctx.m_blockSurfaceFeedback)
         fallback.surface->presentFeedback(fallback.when, fallback.pMonitor->m_self.lock());
     if (fallback.surface->m_current.buffer && !fallback.surface->m_current.buffer->isSynchronous())
-        g_pHyprRenderer->m_usedAsyncBuffers.emplace_back(fallback.surface->m_current.buffer);
+        Render::addSurfaceBufferUse(ctx.m_usedAsyncBuffers, fallback.surface, fallback.surface->m_current.buffer);
     return true;
 }
 
@@ -262,20 +262,20 @@ class SurfacePass final : public IPassElement {
   public:
     explicit SurfacePass(SurfaceData data) : m_data(std::move(data)) {}
 
-    std::vector<UP<IPassElement>> draw() override {
-        if (drawSurface(m_data))
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
+        if (drawSurface(ctx, m_data))
             return {};
         std::vector<UP<IPassElement>> fallback;
         fallback.emplace_back(makeUnique<CSurfacePassElement>(m_data.fallback));
         return fallback;
     }
 
-    bool needsLiveBlur() override { return false; }
-    bool needsPrecomputeBlur() override { return false; }
-    void discard() override { CSurfacePassElement(m_data.fallback).discard(); }
+    bool needsLiveBlur(Render::CRenderContext&) override { return false; }
+    bool needsPrecomputeBlur(Render::CRenderContext&) override { return false; }
+    void discard(Render::CRenderContext& ctx) override { CSurfacePassElement(m_data.fallback).discard(ctx); }
     const char* passName() override { return "GloViewPreviewFilter"; }
     ePassElementType type() override { return EK_CUSTOM; }
-    std::optional<CBox> boundingBox() override {
+    std::optional<CBox> boundingBox(Render::CRenderContext&) override {
         if (!m_data.fallback.pMonitor || m_data.fallback.pMonitor->m_scale <= 0.0)
             return std::nullopt;
         const double scale = m_data.fallback.pMonitor->m_scale;

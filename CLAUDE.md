@@ -44,7 +44,9 @@ produces a `.so` that crashes on load. Local builds use the installed Hyprland v
 `pkg-config hyprland`; `flake.nix` pins a **tagged** Hyprland release (never `main`, whose
 dep tree is intermittently unbuildable) and downstream sets `inputs.hyprland.follows`.
 When that pin and the version the source targets diverge, `nix build` (and therefore CI) is
-compiling against a different compositor than local dev.
+compiling against a different compositor than local dev. The source targets **Hyprland 0.57**;
+`hyprpm.toml`'s `commit_pins` send 0.56.x (matched by Hyprland commit hash) to the last
+pre-0.57 gloview commit. A port to a new Hyprland series adds pins for the previous one.
 
 ## Reloading (there is no `reload.sh` — and on purpose)
 
@@ -96,7 +98,8 @@ Four translation units, layered by Hyprland coupling:
   the dispatchers, the `hyprctl` commands, and (Lua config only) the `gloview.*` Lua
   functions. Owns the `g_overview` singleton. Every user-facing entry point exists here in
   **three parallel registrations** — `addDispatcherV2`, `registerHyprCtlCommand`
-  (`.exact = true`), `addLuaFunction` — and a new one should add all three.
+  (`IPC::Socket1::SCommand`, `.match = COMMAND_MATCH_EXACT`), `addLuaFunction` — and a new
+  one should add all three.
 - **`src/overview.{cpp,hpp}`** (~3450 lines) — the `Overview` class. All Hyprland-coupled
   logic: rendering, input, snapshot capture, animation, drag-and-drop, workspace ops.
   `overview.hpp` is the map of it, and its comments carry most of the hard-won reasoning.
@@ -119,7 +122,10 @@ like it does nothing under a Lua config. Config is read live (per frame); colors
 
 The overview is an overlay pass, not a window. `Overview` listens to Hyprland's event bus
 (`render.stage`, mouse button/move/**axis**, keyboard). At the **`RENDER_LAST_MOMENT`** stage
-(after bars/overlay layers, so the overview paints over them) `renderStage()` adds, in order:
+(after bars/overlay layers, so the overview paints over them) `renderStage()` adds, in order
+(0.57: every draw and queue goes through the stage's `Render::CRenderContext` — `ev.context`,
+`Render::IHyprRenderer::addPassElement(ctx, …)`, `g_pHyprOpenGL->renderRect(ctx, …)`; there is
+no global render pass or `m_renderData` any more):
 
 ```
 COverlayPass(Back)        backdrop, preview shadows/backings/titles (incl. the outgoing set mid-slide)
